@@ -31,9 +31,8 @@ class Config:
     # 训练相关
     BATCH_SIZE = 16           # 实际 batch size = 16 identity，每个 identity 有两个 view
     MAX_NUM_WORKERS = 4
-    NUM_WORKERS = min(MAX_NUM_WORKERS, os.cpu_count() or 1)
     DATA_LOADER_TIMEOUT = 120
-    CUDA_NUM_WORKERS = 0
+    GPU_NUM_WORKERS = 0
     N_EPOCHS = 100
     LR = 1e-3
     WEIGHT_DECAY = 1e-4
@@ -115,6 +114,7 @@ class WOAContrastiveDataset(Dataset):
         max_duration_sec: float = 10.0,
     ):
         super().__init__()
+        self._warned_paths: set = set()
         self.sample_rate = sample_rate
         self.max_len = int(max_duration_sec * sample_rate)
 
@@ -167,8 +167,6 @@ class WOAContrastiveDataset(Dataset):
         # 把 id_to_class 映射成真正的 int label
         for _id in self.identities:
             self.id_to_class[_id] = self.class_map[self.id_to_class[_id]]
-
-        self._warned_paths: set = set()
 
         print(f"[WOAContrastiveDataset] loaded {len(self.df)} rows, {len(self.identities)} identities "
               f"with >= {min_samples_per_id} samples each.")
@@ -693,7 +691,8 @@ def train_contrastive(cfg: Config):
 
     device = torch.device(cfg.DEVICE)
     print(f"Using device: {device}")
-    num_workers = cfg.CUDA_NUM_WORKERS if device.type == "cuda" else cfg.NUM_WORKERS
+    cpu_workers = min(cfg.MAX_NUM_WORKERS, os.cpu_count() or 1)
+    num_workers = cfg.GPU_NUM_WORKERS if device.type == "cuda" else cpu_workers
 
     loader = DataLoader(
         dataset,
