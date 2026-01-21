@@ -51,6 +51,7 @@ for s = 1:numel(SSP_TYPES)
         % Src: 100-1100 m (6 sampling points)
         % Rcv: 固定 10 m
         src_z = 100:200:1100;
+        src_z = src_z(src_z <= depth_val);
         rcv_z = 10;
         
         % 对每个距离生成一个 env

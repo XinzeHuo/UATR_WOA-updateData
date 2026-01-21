@@ -181,7 +181,7 @@ end
 error('No valid SSP data found in mat file; expected direct SSP data only.');
 
 % ======================================================================
-%  若没有 ssp 或使用失败，则退回到 Temp/Sal → Mackenzie 声速路径
+%  Legacy Temp/Sal → Mackenzie path (disabled for SSP-only datasets)
 % ======================================================================
 
 % ---- 查找温度/盐度数组 ----
