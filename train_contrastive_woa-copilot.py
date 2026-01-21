@@ -30,7 +30,8 @@ class Config:
 
     # 训练相关
     BATCH_SIZE = 16           # 实际 batch size = 16 identity，每个 identity 有两个 view
-    NUM_WORKERS = min(4, os.cpu_count() or 1)
+    MAX_NUM_WORKERS = 4
+    NUM_WORKERS = min(MAX_NUM_WORKERS, os.cpu_count() or 1)
     DATA_LOADER_TIMEOUT = 300
     N_EPOCHS = 100
     LR = 1e-3
@@ -697,7 +698,7 @@ def train_contrastive(cfg: Config):
         batch_size=cfg.BATCH_SIZE,
         shuffle=True,
         num_workers=cfg.NUM_WORKERS,
-        pin_memory=device.type == "cuda" and torch.cuda.is_available(),
+        pin_memory=device.type == "cuda",
         drop_last=True,
         timeout=cfg.DATA_LOADER_TIMEOUT if cfg.NUM_WORKERS > 0 else 0
     )
