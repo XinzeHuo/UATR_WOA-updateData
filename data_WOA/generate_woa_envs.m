@@ -53,7 +53,7 @@ for s = 1:numel(SSP_TYPES)
         src_z = 100:200:1100;
         src_z = src_z(src_z <= depth_val);
         if isempty(src_z)
-            src_z = max(1, min(50, depth_val / 2));
+            src_z = max(1, min(50, round(depth_val / 2)));
         end
         rcv_z = min(10, max(1, depth_val - 5));
         

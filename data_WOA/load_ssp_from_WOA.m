@@ -178,7 +178,7 @@ if isfield(data, 'ssp')
     end
 end
 
-error('No valid SSP data found in mat file; expected direct SSP data only.');
+error('No valid SSP data found in mat file: %s (expected direct SSP data only).', matfile);
 
 % ======================================================================
 %  Legacy Temp/Sal → Mackenzie path (disabled for SSP-only datasets)
