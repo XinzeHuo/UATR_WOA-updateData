@@ -53,9 +53,9 @@ for s = 1:numel(SSP_TYPES)
         src_z = 100:200:1100;
         src_z = src_z(src_z <= depth_val);
         if isempty(src_z)
-            src_z = max(1, depth_val - 1);
+            src_z = max(1, min(50, depth_val / 2));
         end
-        rcv_z = 10;
+        rcv_z = min(10, max(1, depth_val - 5));
         
         % 对每个距离生成一个 env
         for r = 1:numel(R_list)
