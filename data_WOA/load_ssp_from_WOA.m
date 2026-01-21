@@ -166,12 +166,19 @@ if isfield(data, 'ssp')
             % 插值到目标 depth_grid
             c_interp = interp1(depth_vals, c_profile, depth_grid, 'linear', 'extrap');
 
-            ssp.z = depth_grid(:);
-            ssp.c = c_interp(:);
+            % 去掉 NaN/Inf，避免构建失败
+            valid = isfinite(depth_grid) & isfinite(c_interp);
+            ssp.z = depth_grid(valid);
+            ssp.c = c_interp(valid);
+            if isempty(ssp.z)
+                error('SSP interpolation resulted in empty profile after removing NaN/Inf.');
+            end
             return;
         end
     end
 end
+
+error('No valid SSP data found in mat file; expected direct SSP data only.');
 
 % ======================================================================
 %  若没有 ssp 或使用失败，则退回到 Temp/Sal → Mackenzie 声速路径

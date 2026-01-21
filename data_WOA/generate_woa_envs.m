@@ -48,10 +48,10 @@ for s = 1:numel(SSP_TYPES)
         end
 
         % 设置收发深度
-        % Src: 约 1/4 水深
-        % Rcv: 放置两个接收器，一个在浅层，一个在深层
-        src_z = max(5, round(0.2 * depth_val));
-        rcv_z = [max(10, round(0.4 * depth_val)), max(10, round(0.8 * depth_val))];
+        % Src: 100-1100 m (6 sampling points)
+        % Rcv: 固定 10 m
+        src_z = 100:200:1100;
+        rcv_z = 10;
         
         % 对每个距离生成一个 env
         for r = 1:numel(R_list)
