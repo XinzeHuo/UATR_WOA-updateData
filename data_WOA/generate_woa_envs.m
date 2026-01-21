@@ -101,7 +101,10 @@ for s = 1:numel(SSP_TYPES)
                         if ~isempty(BELLHOP_EXE)
                             bellhop_cmd = BELLHOP_EXE;
                         end
-                        safe_env = regexprep(envName, '[^\w\-.]', '');
+                        safe_env = regexprep(envName, '[^\w\-_]', '');
+                        if ~strcmp(safe_env, envName)
+                            warning('Sanitized env name from "%s" to "%s".', envName, safe_env);
+                        end
                         if isempty(safe_env)
                             error('Invalid env name after sanitization: %s', envName);
                         end
@@ -117,8 +120,9 @@ for s = 1:numel(SSP_TYPES)
                     end
 
                     cd(old_dir);
-                catch
+                catch ME
                     cd(old_dir);
+                    warning('Bellhop run failed for %s: %s', envName, ME.message);
                     run_status = 0;
                 end
                 
