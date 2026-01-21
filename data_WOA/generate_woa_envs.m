@@ -56,13 +56,21 @@ for s = 1:numel(SSP_TYPES)
         % 设置收发深度
         % Src: 100-1100 m (6 sampling points)
         % Rcv: 固定 10 m
-        src_z = 100:200:1100;
+        if isempty(ssp.z)
+            warning('Empty SSP depth vector for %s; skip environment generation.', SSP_TYPES{s});
+            continue;
+        end
+        src_z_candidates = 100:200:1100;
         max_allowable_depth = max(1, min(depth_val - 1, max(ssp.z)));
         % Keep source depths below seabed while respecting SSP coverage
-        src_z = src_z(src_z <= max_allowable_depth);
+        src_z = src_z_candidates(src_z_candidates <= max_allowable_depth);
+        if numel(src_z) < numel(src_z_candidates)
+            warning('Clamped src_z to max depth %.1f m for %s.', max_allowable_depth, SSP_TYPES{s});
+        end
         if isempty(src_z)
-            warning('All src_z exceed max depth %.1f m; using max depth instead.', max_allowable_depth);
-            src_z = [max_allowable_depth];
+            fallback_depth = min(100, max_allowable_depth);
+            warning('All src_z exceed max depth %.1f m; using %.1f m instead.', max_allowable_depth, fallback_depth);
+            src_z = [fallback_depth];
         end
         rcv_z = 10;
         
