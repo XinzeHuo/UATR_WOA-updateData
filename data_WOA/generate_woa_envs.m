@@ -57,6 +57,12 @@ for s = 1:numel(SSP_TYPES)
         % Src: 100-1100 m (6 sampling points)
         % Rcv: 固定 10 m
         src_z = 100:200:1100;
+        max_src_z = min(depth_val, max(ssp.z));
+        src_z = src_z(src_z <= max_src_z);
+        if isempty(src_z)
+            warning('All src_z exceed max depth %.1f m; using max depth instead.', max_src_z);
+            src_z = max_src_z;
+        end
         rcv_z = 10;
         
         % 对每个距离生成一个 env
