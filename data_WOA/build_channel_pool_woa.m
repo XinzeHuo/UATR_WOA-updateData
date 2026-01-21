@@ -23,7 +23,7 @@ function ChannelPool = build_channel_pool_woa(arr_dir, max_paths, normalize_ampl
     if nargin < 3 || isempty(normalize_amplitude)
         normalize_amplitude = true;
     end
-    DEFAULT_RECEIVER_DEPTH_M = 10;
+    DEFAULT_RECEIVER_DEPTH_M = 10; % match fixed receiver depth in generate_woa_envs.m
 
     arr_files = dir(fullfile(arr_dir, '*.arr'));
     if isempty(arr_files)
