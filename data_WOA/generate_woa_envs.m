@@ -27,7 +27,13 @@ env_idx   = 1;
 success_count = 0;
 
 % 添加 bellhop 工具箱路径（如果需要）
-% addpath('你的/at/工具箱/路径'); 
+% addpath('你的/at/工具箱/路径');
+
+% 可选：显式指定 bellhop.exe 路径（为空时使用系统 PATH 或 MATLAB 版 bellhop）
+BELLHOP_EXE = '';
+if ~isempty(BELLHOP_EXE) && exist(BELLHOP_EXE, 'file') ~= 2
+    error('BELLHOP_EXE not found: %s', BELLHOP_EXE);
+end
 
 for s = 1:numel(SSP_TYPES)
     for h = 1:numel(H_list)
@@ -48,10 +54,27 @@ for s = 1:numel(SSP_TYPES)
         end
 
         % 设置收发深度
-        % Src: 约 1/4 水深
-        % Rcv: 放置两个接收器，一个在浅层，一个在深层
-        src_z = max(5, round(0.2 * depth_val));
-        rcv_z = [max(10, round(0.4 * depth_val)), max(10, round(0.8 * depth_val))];
+        % Src: 100-1100 m (6 sampling points)
+        % Rcv: 固定 10 m
+        if isempty(ssp.z)
+            warning('Empty SSP depth vector for %s; skip environment generation.', SSP_TYPES{s});
+            continue;
+        end
+        src_z_candidates = 100:200:1100;
+        MIN_DEPTH = 1;
+        SEABED_CLEARANCE = 1;
+        max_allowable_depth = max(MIN_DEPTH, min(depth_val - SEABED_CLEARANCE, max(ssp.z)));
+        % Keep source depths below seabed while respecting SSP coverage
+        src_z = src_z_candidates(src_z_candidates <= max_allowable_depth);
+        if numel(src_z) < numel(src_z_candidates)
+            warning('Clamped src_z to max depth %.1f m for %s.', max_allowable_depth, SSP_TYPES{s});
+        end
+        if isempty(src_z)
+            fallback_depth = min(src_z_candidates(1), max_allowable_depth);
+            warning('All src_z exceed max depth %.1f m; using %.1f m instead.', max_allowable_depth, fallback_depth);
+            src_z = [fallback_depth];
+        end
+        rcv_z = 10;
         
         % 对每个距离生成一个 env
         for r = 1:numel(R_list)
@@ -82,22 +105,47 @@ for s = 1:numel(SSP_TYPES)
                     % 目录以避免文件名长度问题，且 bellhop 默认在当前目录找 .env
                     old_dir = pwd;
                     cd(out_folder);
-                    
-                    % 调用 Bellhop (假设已安装并配置好)
-                    % 如果是 Windows exe:
-                    system(sprintf('bellhop.exe %s', envName));
-                    
+
+                    % 调用 Bellhop (优先 MATLAB 版，再使用 exe)
+                    ran_bellhop = false;
+                    if exist('bellhop', 'file') == 2
+                        try
+                            bellhop(envName);
+                            ran_bellhop = true;
+                        catch ME
+                            warning('MATLAB bellhop failed: %s', ME.message);
+                        end
+                    end
+                    env_arg = envName;
+                    if isempty(regexp(env_arg, '^[\w-]+$', 'once'))
+                        error('Invalid env name for bellhop: %s', env_arg);
+                    end
+                    if ~ran_bellhop
+                        bellhop_cmd = 'bellhop.exe';
+                        if ~isempty(BELLHOP_EXE)
+                            bellhop_cmd = BELLHOP_EXE;
+                        end
+                        if contains(bellhop_cmd, '"')
+                            error('BELLHOP_EXE contains invalid quotes: %s', bellhop_cmd);
+                        end
+                        status = system(sprintf('"%s" "%s"', bellhop_cmd, env_arg));
+                        if status ~= 0 && isempty(BELLHOP_EXE)
+                            warning('bellhop.exe not found in PATH; set BELLHOP_EXE to its full path.');
+                        end
+                    end
+
                     % 简单的检查：看是否生成了 .arr 文件
-                    if exist([envName '.arr'], 'file')
+                    if exist([env_arg '.arr'], 'file')
                         success_count = success_count + 1;
                     else
                         run_status = 0;
                         % fprintf('Bellhop run finished but no .arr for %s\n', envName);
                     end
-                    
+
                     cd(old_dir);
-                catch
+                catch ME
                     cd(old_dir);
+                    warning('Bellhop run failed for %s: %s', envName, ME.message);
                     run_status = 0;
                 end
                 
