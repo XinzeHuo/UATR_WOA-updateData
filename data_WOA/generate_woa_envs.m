@@ -87,14 +87,24 @@ for s = 1:numel(SSP_TYPES)
                     cd(out_folder);
 
                     % 调用 Bellhop (优先 MATLAB 版，再使用 exe)
-                    if exist('bellhop', 'file') == 2 && strcmpi(func2str(@bellhop), 'bellhop')
-                        bellhop(envName);
-                    else
+                    ran_bellhop = false;
+                    if exist('bellhop', 'file') == 2
+                        try
+                            bellhop(envName);
+                            ran_bellhop = true;
+                        catch ME
+                            warning('MATLAB bellhop failed: %s', ME.message);
+                        end
+                    end
+                    if ~ran_bellhop
                         bellhop_cmd = 'bellhop.exe';
                         if ~isempty(BELLHOP_EXE)
                             bellhop_cmd = BELLHOP_EXE;
                         end
                         safe_env = regexprep(envName, '[^\w\-.]', '');
+                        if isempty(safe_env)
+                            error('Invalid env name after sanitization: %s', envName);
+                        end
                         system(sprintf('"%s" %s', bellhop_cmd, safe_env));
                     end
 
