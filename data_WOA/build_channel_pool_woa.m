@@ -23,6 +23,7 @@ function ChannelPool = build_channel_pool_woa(arr_dir, max_paths, normalize_ampl
     if nargin < 3 || isempty(normalize_amplitude)
         normalize_amplitude = true;
     end
+    DEFAULT_RECEIVER_DEPTH_M = 10;
 
     arr_files = dir(fullfile(arr_dir, '*.arr'));
     if isempty(arr_files)
@@ -157,7 +158,7 @@ function ChannelPool = build_channel_pool_woa(arr_dir, max_paths, normalize_ampl
             [meta.env_name, meta.ssp_type, meta.H, meta.bottom_type] = parse_env_meta(arr_name);
 
             if isnan(meta.rcv_z_m)
-                meta.rcv_z_m = 10;
+                meta.rcv_z_m = DEFAULT_RECEIVER_DEPTH_M;
             end
 
             % ---------- 写入 ChannelPool ----------
