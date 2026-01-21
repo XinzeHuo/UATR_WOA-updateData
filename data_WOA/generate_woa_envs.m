@@ -27,7 +27,10 @@ env_idx   = 1;
 success_count = 0;
 
 % 添加 bellhop 工具箱路径（如果需要）
-% addpath('你的/at/工具箱/路径'); 
+% addpath('你的/at/工具箱/路径');
+
+% 可选：显式指定 bellhop.exe 路径（为空时使用系统 PATH 或 MATLAB 版 bellhop）
+BELLHOP_EXE = '';
 
 for s = 1:numel(SSP_TYPES)
     for h = 1:numel(H_list)
@@ -82,11 +85,18 @@ for s = 1:numel(SSP_TYPES)
                     % 目录以避免文件名长度问题，且 bellhop 默认在当前目录找 .env
                     old_dir = pwd;
                     cd(out_folder);
-                    
-                    % 调用 Bellhop (假设已安装并配置好)
-                    % 如果是 Windows exe:
-                    system(sprintf('bellhop.exe %s', envName));
-                    
+
+                    % 调用 Bellhop (优先 MATLAB 版，再使用 exe)
+                    if exist('bellhop', 'file') == 2
+                        bellhop(envName);
+                    else
+                        bellhop_cmd = 'bellhop.exe';
+                        if ~isempty(BELLHOP_EXE)
+                            bellhop_cmd = BELLHOP_EXE;
+                        end
+                        system(sprintf('"%s" %s', bellhop_cmd, envName));
+                    end
+
                     % 简单的检查：看是否生成了 .arr 文件
                     if exist([envName '.arr'], 'file')
                         success_count = success_count + 1;
@@ -94,7 +104,7 @@ for s = 1:numel(SSP_TYPES)
                         run_status = 0;
                         % fprintf('Bellhop run finished but no .arr for %s\n', envName);
                     end
-                    
+
                     cd(old_dir);
                 catch
                     cd(old_dir);
