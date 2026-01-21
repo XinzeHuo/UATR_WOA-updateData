@@ -32,7 +32,8 @@ class Config:
     BATCH_SIZE = 16           # 实际 batch size = 16 identity，每个 identity 有两个 view
     MAX_NUM_WORKERS = 4
     NUM_WORKERS = min(MAX_NUM_WORKERS, os.cpu_count() or 1)
-    DATA_LOADER_TIMEOUT = 300
+    DATA_LOADER_TIMEOUT = 120
+    CUDA_NUM_WORKERS = 0
     N_EPOCHS = 100
     LR = 1e-3
     WEIGHT_DECAY = 1e-4
@@ -247,7 +248,7 @@ class WOAContrastiveDataset(Dataset):
 
     @property
     def MONO(self):
-        return True
+        return cfg.MONO
 
     def __getitem__(self, index):
         # index 是 identity 的索引
@@ -692,15 +693,16 @@ def train_contrastive(cfg: Config):
 
     device = torch.device(cfg.DEVICE)
     print(f"Using device: {device}")
+    num_workers = cfg.CUDA_NUM_WORKERS if device.type == "cuda" else cfg.NUM_WORKERS
 
     loader = DataLoader(
         dataset,
         batch_size=cfg.BATCH_SIZE,
         shuffle=True,
-        num_workers=cfg.NUM_WORKERS,
+        num_workers=num_workers,
         pin_memory=device.type == "cuda",
         drop_last=True,
-        timeout=cfg.DATA_LOADER_TIMEOUT if cfg.NUM_WORKERS > 0 else 0
+        timeout=cfg.DATA_LOADER_TIMEOUT if num_workers > 0 else 0
     )
 
     model = ContrastiveModel(cfg).to(device)
