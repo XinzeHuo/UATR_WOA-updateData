@@ -99,20 +99,26 @@ for s = 1:numel(SSP_TYPES)
                             warning('MATLAB bellhop failed: %s', ME.message);
                         end
                     end
-                    safe_env = envName;
+                    env_arg = envName;
+                    if isempty(regexp(env_arg, '^[\w-]+$', 'once'))
+                        error('Invalid env name for bellhop: %s', env_arg);
+                    end
                     if ~ran_bellhop
                         bellhop_cmd = 'bellhop.exe';
                         if ~isempty(BELLHOP_EXE)
                             bellhop_cmd = BELLHOP_EXE;
                         end
-                        if isempty(regexp(safe_env, '^[\w-]+$', 'once'))
-                            error('Invalid env name for bellhop: %s', safe_env);
+                        if contains(bellhop_cmd, '"')
+                            error('BELLHOP_EXE contains invalid quotes: %s', bellhop_cmd);
                         end
-                        system(sprintf('"%s" "%s"', bellhop_cmd, safe_env));
+                        status = system(sprintf('"%s" "%s"', bellhop_cmd, env_arg));
+                        if status ~= 0 && isempty(BELLHOP_EXE)
+                            warning('bellhop.exe not found in PATH; set BELLHOP_EXE to its full path.');
+                        end
                     end
 
                     % 简单的检查：看是否生成了 .arr 文件
-                    if exist([safe_env '.arr'], 'file')
+                    if exist([env_arg '.arr'], 'file')
                         success_count = success_count + 1;
                     else
                         run_status = 0;
