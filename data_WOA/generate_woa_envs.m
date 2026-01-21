@@ -58,10 +58,11 @@ for s = 1:numel(SSP_TYPES)
         % Rcv: 固定 10 m
         src_z = 100:200:1100;
         max_allowable_depth = max(1, min(depth_val - 1, max(ssp.z)));
+        % Keep source depths below seabed while respecting SSP coverage
         src_z = src_z(src_z <= max_allowable_depth);
         if isempty(src_z)
             warning('All src_z exceed max depth %.1f m; using max depth instead.', max_allowable_depth);
-            src_z = max_allowable_depth;
+            src_z = [max_allowable_depth];
         end
         rcv_z = 10;
         
