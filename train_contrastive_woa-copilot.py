@@ -210,10 +210,7 @@ class WOAContrastiveDataset(Dataset):
         try:
             wav, sr = torchaudio.load(wav_path)
         except Exception as exc:
-            if wav_path not in self._warned_paths and len(self._warned_paths) < cfg.MAX_NONFINITE_WARNINGS:
-                print(f"[WARN] Failed to load audio: {wav_path}. {exc}")
-                self._warned_paths.add(wav_path)
-            return torch.zeros(1, self.max_len, dtype=torch.float32)
+            raise RuntimeError(f"Failed to load audio: {wav_path}. {exc}") from exc
         wav = wav.to(torch.float32)
         if self.MONO:
             if wav.shape[0] > 1:
@@ -679,15 +676,19 @@ def train_contrastive(cfg: Config):
     if not os.path.exists(csv_path):
         raise FileNotFoundError(f"WOA log CSV not found: {csv_path}")
 
+    min_samples_per_id = 2
     dataset = WOAContrastiveDataset(
         csv_path=csv_path,
         split_prefix="train",
-        min_samples_per_id=2,
+        min_samples_per_id=min_samples_per_id,
         sample_rate=cfg.SAMPLE_RATE,
         max_duration_sec=cfg.MAX_DURATION_SEC,
     )
     if len(dataset) == 0:
-        raise ValueError(f"No valid identities found in CSV: {csv_path}")
+        raise ValueError(
+            f"No valid identities found in CSV: {csv_path} "
+            f"(requires min {min_samples_per_id} samples per identity)"
+        )
 
     device = torch.device(cfg.DEVICE)
     print(f"Using device: {device}")
