@@ -31,6 +31,9 @@ success_count = 0;
 
 % 可选：显式指定 bellhop.exe 路径（为空时使用系统 PATH 或 MATLAB 版 bellhop）
 BELLHOP_EXE = '';
+if ~isempty(BELLHOP_EXE) && exist(BELLHOP_EXE, 'file') ~= 2
+    error('BELLHOP_EXE not found: %s', BELLHOP_EXE);
+end
 
 for s = 1:numel(SSP_TYPES)
     for h = 1:numel(H_list)
@@ -101,18 +104,15 @@ for s = 1:numel(SSP_TYPES)
                         if ~isempty(BELLHOP_EXE)
                             bellhop_cmd = BELLHOP_EXE;
                         end
-                        safe_env = regexprep(envName, '[^\w\-_]', '');
-                        if ~strcmp(safe_env, envName)
-                            warning('Sanitized env name from "%s" to "%s".', envName, safe_env);
+                        safe_env = envName;
+                        if isempty(regexp(safe_env, '^[\w-]+$', 'once'))
+                            error('Invalid env name for bellhop: %s', envName);
                         end
-                        if isempty(safe_env)
-                            error('Invalid env name after sanitization: %s', envName);
-                        end
-                        system(sprintf('"%s" %s', bellhop_cmd, safe_env));
+                        system(sprintf('"%s" "%s"', bellhop_cmd, safe_env));
                     end
 
                     % 简单的检查：看是否生成了 .arr 文件
-                    if exist([envName '.arr'], 'file')
+                    if exist([safe_env '.arr'], 'file')
                         success_count = success_count + 1;
                     else
                         run_status = 0;
