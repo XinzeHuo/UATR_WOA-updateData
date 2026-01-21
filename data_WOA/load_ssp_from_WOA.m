@@ -167,7 +167,7 @@ if isfield(data, 'ssp')
             c_interp = interp1(depth_vals, c_profile, depth_grid, 'linear', 'extrap');
 
             % 去掉 NaN/Inf，避免构建失败
-            valid = isfinite(depth_grid) & isfinite(c_interp);
+            valid = isfinite(c_interp);
             ssp.z = depth_grid(valid);
             ssp.c = c_interp(valid);
             if isempty(ssp.z)

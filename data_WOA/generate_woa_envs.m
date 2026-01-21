@@ -52,6 +52,9 @@ for s = 1:numel(SSP_TYPES)
         % Rcv: 固定 10 m
         src_z = 100:200:1100;
         src_z = src_z(src_z <= depth_val);
+        if isempty(src_z)
+            src_z = max(1, depth_val - 1);
+        end
         rcv_z = 10;
         
         % 对每个距离生成一个 env
