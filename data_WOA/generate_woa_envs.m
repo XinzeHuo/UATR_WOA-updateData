@@ -87,14 +87,15 @@ for s = 1:numel(SSP_TYPES)
                     cd(out_folder);
 
                     % 调用 Bellhop (优先 MATLAB 版，再使用 exe)
-                    if exist('bellhop', 'file') == 2
+                    if exist('bellhop', 'file') == 2 && strcmpi(func2str(@bellhop), 'bellhop')
                         bellhop(envName);
                     else
                         bellhop_cmd = 'bellhop.exe';
                         if ~isempty(BELLHOP_EXE)
                             bellhop_cmd = BELLHOP_EXE;
                         end
-                        system(sprintf('"%s" %s', bellhop_cmd, envName));
+                        safe_env = regexprep(envName, '[^\w\-.]', '');
+                        system(sprintf('"%s" %s', bellhop_cmd, safe_env));
                     end
 
                     % 简单的检查：看是否生成了 .arr 文件
