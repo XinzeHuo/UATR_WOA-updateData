@@ -30,7 +30,8 @@ class Config:
 
     # 训练相关
     BATCH_SIZE = 16           # 实际 batch size = 16 identity，每个 identity 有两个 view
-    NUM_WORKERS = 4
+    NUM_WORKERS = 0
+    DATA_LOADER_TIMEOUT = 300
     N_EPOCHS = 100
     LR = 1e-3
     WEIGHT_DECAY = 1e-4
@@ -115,10 +116,20 @@ class WOAContrastiveDataset(Dataset):
         self.sample_rate = sample_rate
         self.max_len = int(max_duration_sec * sample_rate)
 
+        csv_path = fix_path(csv_path)
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(f"WOA log CSV not found: {csv_path}")
+
         # 读取 CSV，自动识别分隔符
         self.df = pd.read_csv(csv_path, engine="python")
         # 如果分隔是制表符，可以改为:
         # self.df = pd.read_csv(csv_path, sep='\t')
+
+        required_cols = {"rel_path", "out_path"}
+        missing_cols = required_cols.difference(self.df.columns)
+        if missing_cols:
+            missing = ", ".join(sorted(missing_cols))
+            raise ValueError(f"Missing required columns in CSV: {missing}")
 
         # 过滤出对应 split（如 train）
         # 这里根据 rel_path 的前缀简单判断；若你在 log 中有单独的 split 列，可改用 split 列
@@ -196,7 +207,13 @@ class WOAContrastiveDataset(Dataset):
 
     def _load_and_crop(self, wav_path: str) -> torch.Tensor:
         wav_path = fix_path(wav_path)
-        wav, sr = torchaudio.load(wav_path)
+        try:
+            wav, sr = torchaudio.load(wav_path)
+        except Exception as exc:
+            if wav_path not in self._warned_paths and len(self._warned_paths) < cfg.MAX_NONFINITE_WARNINGS:
+                print(f"[WARN] Failed to load audio: {wav_path}. {exc}")
+                self._warned_paths.add(wav_path)
+            return torch.zeros(1, self.max_len, dtype=torch.float32)
         wav = wav.to(torch.float32)
         if self.MONO:
             if wav.shape[0] > 1:
@@ -658,24 +675,32 @@ def contrastive_loss_nt_xent(z1, z2, temperature: float = 0.1):
 
 def train_contrastive(cfg: Config):
     # Dataset & DataLoader
+    csv_path = fix_path(cfg.WOA_LOG_CSV)
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"WOA log CSV not found: {csv_path}")
+
     dataset = WOAContrastiveDataset(
-        csv_path=cfg.WOA_LOG_CSV,
+        csv_path=csv_path,
         split_prefix="train",
         min_samples_per_id=2,
         sample_rate=cfg.SAMPLE_RATE,
         max_duration_sec=cfg.MAX_DURATION_SEC,
     )
+    if len(dataset) == 0:
+        raise ValueError(f"No valid identities found in CSV: {csv_path}")
+
+    device = torch.device(cfg.DEVICE)
+    print(f"Using device: {device}")
+
     loader = DataLoader(
         dataset,
         batch_size=cfg.BATCH_SIZE,
         shuffle=True,
         num_workers=cfg.NUM_WORKERS,
-        pin_memory=True,
-        drop_last=True
+        pin_memory=device.type == "cuda",
+        drop_last=True,
+        timeout=cfg.DATA_LOADER_TIMEOUT if cfg.NUM_WORKERS > 0 else 0
     )
-
-    device = torch.device(cfg.DEVICE)
-    print(f"Using device: {device}")
 
     model = ContrastiveModel(cfg).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
