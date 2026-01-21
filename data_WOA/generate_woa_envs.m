@@ -99,14 +99,14 @@ for s = 1:numel(SSP_TYPES)
                             warning('MATLAB bellhop failed: %s', ME.message);
                         end
                     end
+                    safe_env = envName;
                     if ~ran_bellhop
                         bellhop_cmd = 'bellhop.exe';
                         if ~isempty(BELLHOP_EXE)
                             bellhop_cmd = BELLHOP_EXE;
                         end
-                        safe_env = envName;
                         if isempty(regexp(safe_env, '^[\w-]+$', 'once'))
-                            error('Invalid env name for bellhop: %s', envName);
+                            error('Invalid env name for bellhop: %s', safe_env);
                         end
                         system(sprintf('"%s" "%s"', bellhop_cmd, safe_env));
                     end
