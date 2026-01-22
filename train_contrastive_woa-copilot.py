@@ -559,6 +559,10 @@ class ContrastiveModel(nn.Module):
 #  对比损失 (NT-Xent / InfoNCE)
 # ======================
 
+def _validate_temperature(temperature: float) -> None:
+    _validate_temperature(temperature)
+
+
 def contrastive_loss_nt_xent(z1, z2, temperature: float = 0.1):
     """
     SimCLR 风格的 NT-Xent loss（无标签版，只有 "同索引" 为正样本）。
@@ -603,7 +607,10 @@ def contrastive_loss_nt_xent(z1, z2, temperature: float = 0.1):
     log_prob = logits - torch.logsumexp(logits, dim=1, keepdim=True)
     pos_count = pos_mask.sum(dim=1)
     if torch.any(pos_count == 0):
-        raise ValueError("no positive samples found for some instances in the batch")
+        raise ValueError(
+            "no positive samples found for some instances in the batch; "
+            "increase batch size or check label distribution"
+        )
     loss_pos = (pos_mask * log_prob).sum(dim=1) / pos_count  # [2B]
     loss = -loss_pos.mean()
 
@@ -617,8 +624,7 @@ def contrastive_loss_supervised(z1, z2, labels, temperature: float = 0.1):
       z1, z2: [B, D]
       labels: [B]
     """
-    if temperature < cfg.MIN_TEMPERATURE:
-        raise ValueError(f"temperature must be >= {cfg.MIN_TEMPERATURE}")
+    _validate_temperature(temperature)
     batch_size = z1.size(0)
     if labels.size(0) != batch_size:
         raise ValueError("labels size must match batch size")
@@ -638,7 +644,10 @@ def contrastive_loss_supervised(z1, z2, labels, temperature: float = 0.1):
     log_prob = logits - torch.logsumexp(logits, dim=1, keepdim=True)
     pos_count = pos_mask.sum(dim=1)
     if torch.any(pos_count == 0):
-        raise ValueError("no positive samples found for some instances in the batch")
+        raise ValueError(
+            "no positive samples found for some instances in the batch; "
+            "increase batch size or check label distribution"
+        )
     loss_pos = (pos_mask * log_prob).sum(dim=1) / pos_count
     return -loss_pos.mean()
 

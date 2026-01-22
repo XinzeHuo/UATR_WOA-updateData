@@ -431,7 +431,10 @@ def main():
 
             # [新增] 混合精度上下文
             with autocast():
-                with torch.no_grad() if CONFIG["woa_freeze"] else torch.enable_grad():
+                if CONFIG["woa_freeze"]:
+                    with torch.no_grad():
+                        woa_feat = woa_encoder(woa_wave)
+                else:
                     woa_feat = woa_encoder(woa_wave)
                 feat = model(x1, x2, woa_feat)
                 logits = arcface(feat, y)
