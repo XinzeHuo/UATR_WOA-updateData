@@ -115,6 +115,7 @@ class WOAContrastiveDataset(Dataset):
     ):
         super().__init__()
         self._warned_paths: set = set()
+        self._sr_ratio_cache: Dict[int, float] = {}
         if sample_rate <= 0:
             raise ValueError(f"sample_rate must be positive, got {sample_rate}")
         self.sample_rate = sample_rate
@@ -214,10 +215,17 @@ class WOAContrastiveDataset(Dataset):
             sr = info.sample_rate
             num_frames = info.num_frames
             if num_frames is None:
-                raise RuntimeError(f"Missing frame count for audio: {wav_path}")
+                raise RuntimeError(
+                    f"Audio file metadata incomplete: missing frame count for {wav_path}. "
+                    "File may be corrupted or in an unsupported format."
+                )
             target_frames = self.max_len
             if sr != self.sample_rate:
-                target_frames = int(math.ceil(self.max_len * sr / self.sample_rate))
+                ratio = self._sr_ratio_cache.get(sr)
+                if ratio is None:
+                    ratio = sr / self.sample_rate
+                    self._sr_ratio_cache[sr] = ratio
+                target_frames = int(math.ceil(self.max_len * ratio))
             if num_frames > target_frames:
                 start = random.randint(0, num_frames - target_frames)
                 wav, sr = torchaudio.load(wav_path, frame_offset=start, num_frames=target_frames)
