@@ -756,3 +756,4 @@ def train_contrastive(cfg: Config):
 
 if __name__ == "__main__":
     train_contrastive(cfg)
+

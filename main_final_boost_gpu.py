@@ -18,6 +18,30 @@ from sklearn.metrics import confusion_matrix, classification_report
 from sklearn.manifold import TSNE
 
 
+def prepare_woa_waveform(y, sr, target_sr, target_len, split):
+    if sr != target_sr:
+        y = librosa.resample(y, orig_sr=sr, target_sr=target_sr)
+    if len(y) < target_len:
+        y = np.pad(y, (0, target_len - len(y)))
+    else:
+        if split == 'train':
+            start = random.randint(0, len(y) - target_len)
+            y = y[start:start + target_len]
+        else:
+            y = y[:target_len]
+    wav = torch.tensor(y, dtype=torch.float32).unsqueeze(0)
+    max_abs = wav.abs().max()
+    if max_abs > 1.0:
+        wav = wav / (max_abs + 1e-6)
+    return wav
+
+
+def _resolve_woa_setting(woa_cfg, config, key, default_key):
+    if key in woa_cfg:
+        return woa_cfg[key]
+    return config[default_key]
+
+
 # ================= 0. 日志与工具 =================
 class Logger(object):
     def __init__(self, filename='result_final_boost_gpu_oridata.txt'):
@@ -45,6 +69,10 @@ CONFIG = {
     "sample_rate": 16000,
     "duration": 30.0,
     "target_len": 938,  # Align to ~30s
+    "woa_encoder_ckpt": "./encoder_contrastive_woa.pt",
+    "woa_freeze": True,
+    "woa_duration_default": 10.0,
+    "woa_test_split": "test",
 
     # 双分辨率配置
     "fft_high": 4096, "hop_high": 512, "mels_high": 128,  # 流1: 高频分辨率
@@ -119,12 +147,16 @@ def get_spectrogram(y, sr, n_fft, hop_length, n_mels, target_len):
 
 
 class ShipsEarDualDataset(Dataset):
-    def __init__(self, root_dir, split="train", config=CONFIG):
+    def __init__(self, root_dir, split="train", config=CONFIG, woa_cfg=None):
         self.config = config
         self.split = split
         self.files = []
         self.labels = []
         self.spec_aug = SpecAugment() if split == 'train' else None
+        woa_cfg = woa_cfg or {}
+        self.woa_sample_rate = int(_resolve_woa_setting(woa_cfg, config, "SAMPLE_RATE", "sample_rate"))
+        self.woa_duration = float(_resolve_woa_setting(woa_cfg, config, "MAX_DURATION_SEC", "woa_duration_default"))
+        self.woa_target_len = int(self.woa_sample_rate * self.woa_duration)
 
         for fpath in glob.glob(os.path.join(root_dir, split, "**", "*.wav"), recursive=True):
             for cls in CLASSES:
@@ -165,12 +197,13 @@ class ShipsEarDualDataset(Dataset):
                                 CONFIG['target_len'])
         # Stream 2: High Time Resolution
         spec2 = get_spectrogram(y, sr, CONFIG['fft_low'], CONFIG['hop_low'], CONFIG['mels_low'], CONFIG['target_len'])
+        woa_wave = prepare_woa_waveform(y, sr, self.woa_sample_rate, self.woa_target_len, self.split)
 
         if self.spec_aug:
             spec1 = self.spec_aug(spec1.squeeze(0)).unsqueeze(0)
             spec2 = self.spec_aug(spec2.squeeze(0)).unsqueeze(0)
 
-        return spec1, spec2, label
+        return spec1, spec2, woa_wave, label
 
 
 # ================= 2. 模型：Dual-Resolution CNN + ArcFace =================
@@ -244,6 +277,55 @@ class DualResNet(nn.Module):
         return feat
 
 
+class WOAEncoder1D(nn.Module):
+    def __init__(self, embed_dim=128, dyn_hidden=128, dropout=0.1):
+        super().__init__()
+        base_channels = max(16, dyn_hidden // 4)
+        mid_channels = max(32, dyn_hidden // 2)
+        self.features = nn.Sequential(
+            nn.Conv1d(1, base_channels, kernel_size=7, stride=2, padding=3),
+            nn.BatchNorm1d(base_channels),
+            nn.ReLU(),
+            nn.Conv1d(base_channels, mid_channels, kernel_size=5, stride=2, padding=2),
+            nn.BatchNorm1d(mid_channels),
+            nn.ReLU(),
+            nn.Conv1d(mid_channels, dyn_hidden, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm1d(dyn_hidden),
+            nn.ReLU(),
+        )
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.dropout = nn.Dropout(dropout)
+        self.fc = nn.Linear(dyn_hidden, embed_dim)
+
+    def forward(self, x):
+        x = self.features(x)
+        x = self.pool(x).squeeze(-1)
+        x = self.dropout(x)
+        return self.fc(x)
+
+
+class DualResNetWithWOA(nn.Module):
+    def __init__(self, feat_dim=128, woa_embed_dim=128):
+        super().__init__()
+        self.backbone = DualResNet(feat_dim=feat_dim)
+        self.woa_proj = nn.Sequential(
+            nn.Linear(woa_embed_dim, feat_dim),
+            nn.BatchNorm1d(feat_dim),
+            nn.ReLU()
+        )
+        self.fuse = nn.Sequential(
+            nn.Linear(feat_dim * 2, feat_dim),
+            nn.BatchNorm1d(feat_dim),
+            nn.ReLU()
+        )
+
+    def forward(self, x1, x2, woa_feat):
+        base_feat = self.backbone(x1, x2)
+        woa_feat = self.woa_proj(woa_feat)
+        fused = torch.cat([base_feat, woa_feat], dim=1)
+        return self.fuse(fused)
+
+
 class ArcFace(nn.Module):
     def __init__(self, in_features, out_features, s=30.0, m=0.50):
         super().__init__()
@@ -274,8 +356,17 @@ def main():
     log("=== Dual-Resolution + ArcFace Training Start (GPU Optimized) ===")
 
     # 1. Dataset
-    train_ds = ShipsEarDualDataset(CONFIG['data_root'], split='train')
-    test_ds = ShipsEarDualDataset(CONFIG['data_root'], split='test')
+    if not os.path.exists(CONFIG['woa_encoder_ckpt']):
+        log(
+            "Error: WOA encoder checkpoint not found at "
+            f"{CONFIG['woa_encoder_ckpt']}. Please ensure the contrastive training "
+            "has been completed and the checkpoint exists."
+        )
+        return
+    woa_ckpt = torch.load(CONFIG['woa_encoder_ckpt'], map_location='cpu')
+    woa_cfg = woa_ckpt.get("cfg", {})
+    train_ds = ShipsEarDualDataset(CONFIG['data_root'], split='train', woa_cfg=woa_cfg)
+    test_ds = ShipsEarDualDataset(CONFIG['data_root'], split='test', woa_cfg=woa_cfg)
 
     # [优化] 使用 pin_memory 和 persistent_workers 加速数据流
     train_loader = DataLoader(
@@ -304,7 +395,17 @@ def main():
     log(f"Class Weights: {w}")
 
     # 2. Model & Loss
-    model = DualResNet(feat_dim=128).to(CONFIG['device'])
+    model = DualResNetWithWOA(feat_dim=128, woa_embed_dim=woa_cfg.get("EMBED_DIM", 128)).to(CONFIG['device'])
+    woa_encoder = WOAEncoder1D(
+        embed_dim=woa_cfg.get("EMBED_DIM", 128),
+        dyn_hidden=woa_cfg.get("DYN_HIDDEN_CHANNELS", 128),
+        dropout=woa_cfg.get("DROPOUT", 0.1)
+    ).to(CONFIG['device'])
+    woa_encoder.load_state_dict(woa_ckpt["encoder_state_dict"])
+    if CONFIG["woa_freeze"]:
+        woa_encoder.eval()
+        for param in woa_encoder.parameters():
+            param.requires_grad = False
     arcface = ArcFace(in_features=128, out_features=5, s=30.0, m=0.3).to(CONFIG['device'])
 
     log(f"Model Params: {sum(p.numel() for p in model.parameters()) / 1e6:.2f}M")
@@ -313,10 +414,10 @@ def main():
     scaler = GradScaler()  # [新增] 混合精度训练
 
     # Optimizing both Backbone and ArcFace Head
-    optimizer = optim.AdamW([
-        {'params': model.parameters()},
-        {'params': arcface.parameters()}
-    ], lr=CONFIG['lr'], weight_decay=CONFIG['weight_decay'])
+    opt_params = [{'params': model.parameters()}, {'params': arcface.parameters()}]
+    if not CONFIG["woa_freeze"]:
+        opt_params.append({'params': woa_encoder.parameters()})
+    optimizer = optim.AdamW(opt_params, lr=CONFIG['lr'], weight_decay=CONFIG['weight_decay'])
 
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=CONFIG['epochs'])
 
@@ -331,17 +432,23 @@ def main():
         # [修复] 移除原来的 Mixup 空循环，直接进行标准训练
         # ArcFace 对 Margin 比较敏感，简单起见在 GPU 优化版中暂不使用 Mixup
 
-        for x1, x2, y in train_loader:
+        for x1, x2, woa_wave, y in train_loader:
             # [优化] non_blocking=True 加速数据传输
             x1 = x1.to(CONFIG['device'], non_blocking=True)
             x2 = x2.to(CONFIG['device'], non_blocking=True)
+            woa_wave = woa_wave.to(CONFIG['device'], non_blocking=True)
             y = y.to(CONFIG['device'], non_blocking=True)
 
             optimizer.zero_grad()
 
             # [新增] 混合精度上下文
             with autocast():
-                feat = model(x1, x2)
+                if CONFIG["woa_freeze"]:
+                    with torch.no_grad():
+                        woa_feat = woa_encoder(woa_wave)
+                else:
+                    woa_feat = woa_encoder(woa_wave)
+                feat = model(x1, x2, woa_feat)
                 logits = arcface(feat, y)
                 loss = criterion(logits, y)
 
@@ -366,13 +473,15 @@ def main():
         # TTA: For each test sample, we just predict once here to save time during epoch.
         # Final evaluation will use TTA.
         with torch.no_grad():
-            for x1, x2, y in test_loader:
+            for x1, x2, woa_wave, y in test_loader:
                 x1 = x1.to(CONFIG['device'], non_blocking=True)
                 x2 = x2.to(CONFIG['device'], non_blocking=True)
+                woa_wave = woa_wave.to(CONFIG['device'], non_blocking=True)
                 y = y.to(CONFIG['device'], non_blocking=True)
 
                 with autocast():
-                    feat = model(x1, x2)
+                    woa_feat = woa_encoder(woa_wave)
+                    feat = model(x1, x2, woa_feat)
                     logits = arcface(feat)  # No label needed for inference
 
                 _, pred = logits.max(1)
@@ -435,7 +544,19 @@ def main():
 
             with torch.no_grad():
                 with autocast():
-                    feat = model(s1.unsqueeze(0).to(CONFIG['device']), s2.unsqueeze(0).to(CONFIG['device']))
+                    woa_wave = prepare_woa_waveform(
+                        pad_y,
+                        sr,
+                        train_ds.woa_sample_rate,
+                        train_ds.woa_target_len,
+                        CONFIG["woa_test_split"]
+                    )
+                    woa_feat = woa_encoder(woa_wave.unsqueeze(0).to(CONFIG['device']))
+                    feat = model(
+                        s1.unsqueeze(0).to(CONFIG['device']),
+                        s2.unsqueeze(0).to(CONFIG['device']),
+                        woa_feat
+                    )
                     logits = arcface(feat)  # returns scaled cosine
                 logits_sum += logits
 
