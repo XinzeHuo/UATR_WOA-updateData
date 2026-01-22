@@ -491,9 +491,11 @@ class PhyLDCEncoder(nn.Module):
         mid_channels = max(cfg.CNN_MIN_MID_CHANNELS, dyn_hidden_channels // cfg.CNN_MID_DIVISOR)
 
         self.features = nn.Sequential(
+            # SincConv1d: kernel_size=251 (~15.7ms at 16kHz) suitable for capturing phonetic/acoustic features
             SincConv1d(base_channels, kernel_size=251, sample_rate=sample_rate),
             nn.BatchNorm1d(base_channels),
             nn.ReLU(),
+            # MaxPool1d matches the original stride=2 downsampling of the replaced Conv1d layer
             nn.MaxPool1d(kernel_size=3, stride=2, padding=1),
             nn.Conv1d(base_channels, mid_channels, kernel_size=5, stride=2, padding=2),
             nn.BatchNorm1d(mid_channels),
