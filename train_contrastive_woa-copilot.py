@@ -37,6 +37,7 @@ class Config:
     GPU_NUM_WORKERS = 0
     N_EPOCHS = 100
     LR = 1e-3
+    LR_MIN = 1e-5
     WEIGHT_DECAY = 1e-4
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
     LOG_INTERVAL = 20
@@ -44,7 +45,8 @@ class Config:
 
     # 对比学习
     CONTRASTIVE_TEMPERATURE = 0.1
-    USE_SUPERVISED_CONTRASTIVE = False  # True 时利用类别标签做 supervised contrastive
+    USE_SUPERVISED_CONTRASTIVE = True  # 可切换以比较无监督与监督对比学习效果
+    GRAD_CLIP_NORM = 1.0
 
     # 编码器结构
     DYN_HIDDEN_CHANNELS = 128
@@ -557,6 +559,17 @@ class ContrastiveModel(nn.Module):
 #  对比损失 (NT-Xent / InfoNCE)
 # ======================
 
+def _validate_temperature(temperature: float) -> None:
+    if temperature < cfg.MIN_TEMPERATURE:
+        raise ValueError(f"temperature must be >= {cfg.MIN_TEMPERATURE}")
+
+
+def _mask_logits(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    mask_floor = torch.finfo(logits.dtype).min
+    mask_value = cfg.MASK_VALUE_LIMIT if mask_floor < cfg.MASK_VALUE_LIMIT else mask_floor
+    return logits.masked_fill(mask, mask_value)
+
+
 def contrastive_loss_nt_xent(z1, z2, temperature: float = 0.1):
     """
     SimCLR 风格的 NT-Xent loss（无标签版，只有 "同索引" 为正样本）。
@@ -565,8 +578,7 @@ def contrastive_loss_nt_xent(z1, z2, temperature: float = 0.1):
     输出:
       标量 loss
     """
-    if temperature < cfg.MIN_TEMPERATURE:
-        raise ValueError(f"temperature must be >= {cfg.MIN_TEMPERATURE}")
+    _validate_temperature(temperature)
     batch_size = z1.size(0)
 
     # L2 normalize
@@ -591,21 +603,54 @@ def contrastive_loss_nt_xent(z1, z2, temperature: float = 0.1):
         pos_mask[i + batch_size, i] = True
 
     # logits
-    logits = similarity_matrix / temperature
-    mask_floor = torch.finfo(logits.dtype).min
-    mask_value = cfg.MASK_VALUE_LIMIT if mask_floor < cfg.MASK_VALUE_LIMIT else mask_floor
-    logits = logits.masked_fill(mask, mask_value)  # 忽略自己
+    logits = _mask_logits(similarity_matrix / temperature, mask)  # 忽略自己
 
     # 对每个样本，只有一个正样本
     # log( exp(sim(pos)/temp) / sum(exp(sim(all)/temp)) )
     log_prob = logits - torch.logsumexp(logits, dim=1, keepdim=True)
     pos_count = pos_mask.sum(dim=1)
     if torch.any(pos_count == 0):
-        raise ValueError("no positive samples found for some instances in the batch")
+        raise ValueError(
+            "no positive samples found for some instances in the batch; "
+            "increase batch size or check label distribution"
+        )
     loss_pos = (pos_mask * log_prob).sum(dim=1) / pos_count  # [2B]
     loss = -loss_pos.mean()
 
     return loss
+
+
+def contrastive_loss_supervised(z1, z2, labels, temperature: float = 0.1):
+    """
+    Supervised contrastive loss: use same-class samples as positives.
+    输入:
+      z1, z2: [B, D]
+      labels: [B]
+    """
+    _validate_temperature(temperature)
+    batch_size = z1.size(0)
+    if labels.size(0) != batch_size:
+        raise ValueError("labels size must match batch size")
+
+    z = torch.cat([z1, z2], dim=0)
+    z = F.normalize(z, dim=1, eps=cfg.NORMALIZE_EPS)
+    labels = labels.repeat(2)
+
+    logits = torch.matmul(z, z.t()) / temperature
+    mask = torch.eye(2 * batch_size, dtype=torch.bool, device=z.device)
+    logits = _mask_logits(logits, mask)
+
+    pos_mask = labels.unsqueeze(0) == labels.unsqueeze(1)
+    pos_mask = pos_mask & ~mask
+    log_prob = logits - torch.logsumexp(logits, dim=1, keepdim=True)
+    pos_count = pos_mask.sum(dim=1)
+    if torch.any(pos_count == 0):
+        raise ValueError(
+            "no positive samples found for some instances in the batch; "
+            "increase batch size or check label distribution"
+        )
+    loss_pos = (pos_mask * log_prob).sum(dim=1) / pos_count
+    return -loss_pos.mean()
 
 
 # ======================
@@ -649,6 +694,7 @@ def train_contrastive(cfg: Config):
 
     model = ContrastiveModel(cfg).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.N_EPOCHS, eta_min=cfg.LR_MIN)
 
     for epoch in range(1, cfg.N_EPOCHS + 1):
         model.train()
@@ -659,6 +705,7 @@ def train_contrastive(cfg: Config):
         for step, (wav1, wav2, cls) in enumerate(pbar, start=1):
             wav1 = wav1.to(device)  # [B, 1, T]
             wav2 = wav2.to(device)
+            cls = cls.to(device)
 
             _, z1 = model(wav1)   # (encoder_z1, proj_z1)，这里我们只要 proj 输出参与 loss
             _, z2 = model(wav2)
@@ -668,16 +715,24 @@ def train_contrastive(cfg: Config):
                 skipped_steps += 1
                 continue
 
-            loss = contrastive_loss_nt_xent(z1, z2, temperature=cfg.CONTRASTIVE_TEMPERATURE)
+            if cfg.USE_SUPERVISED_CONTRASTIVE:
+                loss = contrastive_loss_supervised(
+                    z1, z2, cls, temperature=cfg.CONTRASTIVE_TEMPERATURE
+                )
+            else:
+                loss = contrastive_loss_nt_xent(z1, z2, temperature=cfg.CONTRASTIVE_TEMPERATURE)
 
             optimizer.zero_grad()
             loss.backward()
+            if cfg.GRAD_CLIP_NORM > 0:
+                nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP_NORM)
             optimizer.step()
 
             epoch_loss += loss.item()
             processed_steps += 1
             if step % cfg.LOG_INTERVAL == 0 and processed_steps > 0:
                 pbar.set_postfix({"loss": epoch_loss / processed_steps})
+        scheduler.step()
 
         avg_epoch_loss = epoch_loss / max(1, processed_steps)
         print(f"[Epoch {epoch}] avg contrastive loss = {avg_epoch_loss:.4f}")
