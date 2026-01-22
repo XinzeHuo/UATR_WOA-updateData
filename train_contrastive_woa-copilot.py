@@ -342,9 +342,10 @@ class SincConv1d(nn.Module):
         band = self.min_band_hz + torch.abs(self.band_hz)         # 保证 > min_band_hz
         high = low + band
 
-        # 归一化频率
-        low = low / (self.sample_rate / 2)
-        high = high / (self.sample_rate / 2)
+        # 归一化频率，并限制在有效范围内避免数值不稳定
+        nyquist = self.sample_rate / 2
+        low = torch.clamp(low / nyquist, 0.0, 0.99)
+        high = torch.clamp(high / nyquist, 0.01, 1.0)
 
         # 构造时间轴
         n = self.n.to(device).unsqueeze(0)  # [1, kernel_size]
@@ -355,6 +356,10 @@ class SincConv1d(nn.Module):
         band_pass = (2 * high * self._sinc(2 * high * n) -
                      2 * low * self._sinc(2 * low * n))
         band_pass = band_pass * self.window.to(device).unsqueeze(0)
+        
+        # 归一化滤波器以避免数值爆炸
+        band_pass = band_pass / (torch.abs(band_pass).max(dim=1, keepdim=True)[0] + 1e-7)
+        
         filters = band_pass.unsqueeze(1)  # [out_channels, 1, kernel_size]
 
         return F.conv1d(x, filters, stride=1, padding=self.kernel_size // 2)
@@ -704,7 +709,22 @@ def train_contrastive(cfg: Config):
     )
 
     model = ContrastiveModel(cfg).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
+    
+    # Use lower learning rate for SincConv parameters to prevent instability
+    sinc_params = []
+    other_params = []
+    for name, param in model.named_parameters():
+        if 'features.0' in name:  # SincConv1d is the first layer in features
+            sinc_params.append(param)
+        else:
+            other_params.append(param)
+    
+    param_groups = [
+        {'params': sinc_params, 'lr': cfg.LR * 0.1, 'name': 'sinc_conv'},  # 10x lower LR for SincConv
+        {'params': other_params, 'lr': cfg.LR, 'name': 'other'}
+    ]
+    
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=cfg.WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.N_EPOCHS, eta_min=cfg.LR_MIN)
 
     for epoch in range(1, cfg.N_EPOCHS + 1):
@@ -722,7 +742,17 @@ def train_contrastive(cfg: Config):
             _, z2 = model(wav2)
 
             if torch.any(~torch.isfinite(z1)) or torch.any(~torch.isfinite(z2)):
-                print(f"[WARN] Non-finite embeddings at epoch {epoch}, step {step}, skip batch.")
+                if skipped_steps == 0:  # Only print detailed diagnostics for first failure
+                    print(f"\n[WARN] Non-finite embeddings detected at epoch {epoch}, step {step}")
+                    print(f"  Input wav1 - min: {wav1.min().item():.6f}, max: {wav1.max().item():.6f}, "
+                          f"has_nan: {torch.isnan(wav1).any().item()}, has_inf: {torch.isinf(wav1).any().item()}")
+                    print(f"  Input wav2 - min: {wav2.min().item():.6f}, max: {wav2.max().item():.6f}, "
+                          f"has_nan: {torch.isnan(wav2).any().item()}, has_inf: {torch.isinf(wav2).any().item()}")
+                    print(f"  Output z1 - has_nan: {torch.isnan(z1).any().item()}, has_inf: {torch.isinf(z1).any().item()}")
+                    print(f"  Output z2 - has_nan: {torch.isnan(z2).any().item()}, has_inf: {torch.isinf(z2).any().item()}")
+                    print(f"  Skipping batch and continuing training...")
+                else:
+                    print(f"[WARN] Non-finite embeddings at epoch {epoch}, step {step}, skip batch.")
                 skipped_steps += 1
                 continue
 
