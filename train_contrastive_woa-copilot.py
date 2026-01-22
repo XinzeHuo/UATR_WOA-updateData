@@ -210,11 +210,11 @@ class WOAContrastiveDataset(Dataset):
         try:
             info = torchaudio.info(wav_path)
             sr = info.sample_rate
-            if info.num_frames is None:
-                raise RuntimeError(f"Missing frame count for audio: {wav_path}")
             num_frames = info.num_frames
+            if num_frames is None:
+                raise RuntimeError(f"Missing frame count for audio: {wav_path}")
             target_frames = self.max_len
-            if sr is not None and sr != self.sample_rate:
+            if sr != self.sample_rate:
                 target_frames = int(math.ceil(self.max_len * sr / self.sample_rate))
             if num_frames > target_frames:
                 start = random.randint(0, num_frames - target_frames)
@@ -332,10 +332,9 @@ class SincConv1d(nn.Module):
         high = high / (self.sample_rate / 2)
 
         # 构造时间轴
-        n = torch.arange(self.kernel_size, device=device) - self.n_0  # 中心对齐
-        n = n.unsqueeze(0)  # [1, kernel_size]
-        low = low.unsqueeze(1)  # [out_channels, 1]
-        high = high.unsqueeze(1)
+        n = (torch.arange(self.kernel_size, device=device) - self.n_0).view(1, -1)  # [1, kernel_size]
+        low = low.view(-1, 1)  # [out_channels, 1]
+        high = high.view(-1, 1)
 
         # sinc band-pass 滤波器（向量化）
         band_pass = (2 * high * self._sinc(2 * high * n) -
