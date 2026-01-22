@@ -46,16 +46,12 @@ class Config:
     CONTRASTIVE_TEMPERATURE = 0.1
     USE_SUPERVISED_CONTRASTIVE = False  # True 时利用类别标签做 supervised contrastive
 
-    # SincConv / 模型结构
-    SINC_NUM_FILTERS = 64
-    SINC_KERNEL_SIZE = 251
-    SINC_MIN_LOW_HZ = 30
-    SINC_MIN_BAND_HZ = 50
-
-    # 动态卷积
+    # 编码器结构
     DYN_HIDDEN_CHANNELS = 128
     DYN_KERNEL_SIZE = 7
     DYN_NUM_BASE_KERNELS = 4
+    CNN_BASE_DIVISOR = 4
+    CNN_MID_DIVISOR = 2
     CNN_MIN_BASE_CHANNELS = 16
     CNN_MIN_MID_CHANNELS = 32
 
@@ -63,11 +59,7 @@ class Config:
     EMBED_DIM = 128
     PROJ_DIM = 128
 
-    # 更丰富的编码器结构
-    RES_KERNEL_SIZE = 5
-    RES_DILATIONS = (1, 2, 4)
     DROPOUT = 0.1
-    SE_REDUCTION = 8
 
     # 数值稳定性
     MASK_VALUE_LIMIT = -1e9
@@ -489,8 +481,8 @@ class PhyLDCEncoder(nn.Module):
         if embed_dim <= 0:
             raise ValueError("embed_dim must be positive")
 
-        base_channels = max(cfg.CNN_MIN_BASE_CHANNELS, dyn_hidden_channels // 4)
-        mid_channels = max(cfg.CNN_MIN_MID_CHANNELS, dyn_hidden_channels // 2)
+        base_channels = max(cfg.CNN_MIN_BASE_CHANNELS, dyn_hidden_channels // cfg.CNN_BASE_DIVISOR)
+        mid_channels = max(cfg.CNN_MIN_MID_CHANNELS, dyn_hidden_channels // cfg.CNN_MID_DIVISOR)
 
         self.features = nn.Sequential(
             nn.Conv1d(1, base_channels, kernel_size=7, stride=2, padding=3),
