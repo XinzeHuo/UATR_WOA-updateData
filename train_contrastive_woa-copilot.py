@@ -35,8 +35,8 @@ class Config:
     TORCH_INTEROP_THREADS = 1
     DATA_LOADER_TIMEOUT = 120
     GPU_NUM_WORKERS = 0
-    N_EPOCHS = 100
-    LR = 1e-3
+    N_EPOCHS = 300
+    LR = 3e-4
     LR_MIN = 1e-5
     WEIGHT_DECAY = 1e-4
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -44,7 +44,8 @@ class Config:
     CKPT_PATH = "./encoder_contrastive_woa.pt"
 
     # 对比学习
-    CONTRASTIVE_TEMPERATURE = 0.1
+    CONTRASTIVE_TEMPERATURE = 0.07
+    DATASET_MULTIPLIER = 10
     USE_SUPERVISED_CONTRASTIVE = True  # 可切换以比较无监督与监督对比学习效果
     GRAD_CLIP_NORM = 1.0
 
@@ -110,6 +111,7 @@ class WOAContrastiveDataset(Dataset):
         min_samples_per_id: int = 2,
         sample_rate: int = 16000,
         max_duration_sec: float = 10.0,
+        multiplier: int = 1,
     ):
         super().__init__()
         self._warned_paths: set = set()
@@ -118,6 +120,7 @@ class WOAContrastiveDataset(Dataset):
             raise ValueError(f"sample_rate must be positive, got {sample_rate}")
         self.sample_rate = sample_rate
         self.max_len = int(max_duration_sec * sample_rate)
+        self.multiplier = multiplier
 
         csv_path = fix_path(csv_path)
         if not os.path.exists(csv_path):
@@ -204,7 +207,7 @@ class WOAContrastiveDataset(Dataset):
         return identity, class_label
 
     def __len__(self):
-        return len(self.identities)
+        return len(self.identities) * self.multiplier
 
     def _load_and_crop(self, wav_path: str) -> torch.Tensor:
         wav_path = fix_path(wav_path)
@@ -267,8 +270,9 @@ class WOAContrastiveDataset(Dataset):
         return cfg.MONO
 
     def __getitem__(self, index):
-        # index 是 identity 的索引
-        identity = self.identities[index]
+        # index 是 identity 的索引（经过 multiplier 扩展）
+        identity_index = index % len(self.identities)
+        identity = self.identities[identity_index]
         indices = self.id_to_indices[identity]
         cls = self.id_to_class[identity]
 
@@ -466,13 +470,15 @@ class SqueezeExcite1d(nn.Module):
 class PhyLDCEncoder(nn.Module):
     """
     轻量级 1D CNN Encoder（对比学习用）：
+      - SincConv1d 前端 + MaxPool
       - 多层下采样卷积 + BN + ReLU
       - Global pooling 输出 embedding
     """
     def __init__(self,
                  dyn_hidden_channels: int = 128,
                  embed_dim: int = 128,
-                 dropout: float = 0.1):
+                 dropout: float = 0.1,
+                 sample_rate: int = 16000):
         super().__init__()
         if not 0 <= dropout <= 1:
             raise ValueError("dropout must be in [0, 1]")
@@ -485,9 +491,10 @@ class PhyLDCEncoder(nn.Module):
         mid_channels = max(cfg.CNN_MIN_MID_CHANNELS, dyn_hidden_channels // cfg.CNN_MID_DIVISOR)
 
         self.features = nn.Sequential(
-            nn.Conv1d(1, base_channels, kernel_size=7, stride=2, padding=3),
+            SincConv1d(base_channels, kernel_size=251, sample_rate=sample_rate),
             nn.BatchNorm1d(base_channels),
             nn.ReLU(),
+            nn.MaxPool1d(kernel_size=3, stride=2, padding=1),
             nn.Conv1d(base_channels, mid_channels, kernel_size=5, stride=2, padding=2),
             nn.BatchNorm1d(mid_channels),
             nn.ReLU(),
@@ -539,7 +546,8 @@ class ContrastiveModel(nn.Module):
         self.encoder = PhyLDCEncoder(
             dyn_hidden_channels=cfg.DYN_HIDDEN_CHANNELS,
             embed_dim=cfg.EMBED_DIM,
-            dropout=cfg.DROPOUT
+            dropout=cfg.DROPOUT,
+            sample_rate=cfg.SAMPLE_RATE
         )
         self.proj = ProjectionHead(cfg.EMBED_DIM, cfg.PROJ_DIM)
 
@@ -670,6 +678,7 @@ def train_contrastive(cfg: Config):
         min_samples_per_id=min_samples_per_id,
         sample_rate=cfg.SAMPLE_RATE,
         max_duration_sec=cfg.MAX_DURATION_SEC,
+        multiplier=cfg.DATASET_MULTIPLIER,
     )
     if len(dataset) == 0:
         raise ValueError(
