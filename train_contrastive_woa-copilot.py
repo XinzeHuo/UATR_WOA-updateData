@@ -344,8 +344,11 @@ class SincConv1d(nn.Module):
 
         # 归一化频率，并限制在有效范围内避免数值不稳定
         nyquist = self.sample_rate / 2
-        low = torch.clamp(low / nyquist, 0.0, 0.99)
-        high = torch.clamp(high / nyquist, 0.01, 1.0)
+        low = torch.clamp(low / nyquist, 0.0, 0.95)
+        high = torch.clamp(high / nyquist, 0.05, 1.0)
+        
+        # 确保 high > low 以避免无效的频带
+        high = torch.max(high, low + 0.05)
 
         # 构造时间轴
         n = self.n.to(device).unsqueeze(0)  # [1, kernel_size]
@@ -358,7 +361,13 @@ class SincConv1d(nn.Module):
         band_pass = band_pass * self.window.to(device).unsqueeze(0)
         
         # 归一化滤波器以避免数值爆炸
-        band_pass = band_pass / (torch.abs(band_pass).max(dim=1, keepdim=True)[0] + 1e-7)
+        max_vals = torch.abs(band_pass).max(dim=1, keepdim=True)[0]
+        # 使用更安全的 epsilon 值，并在滤波器接近零时跳过归一化
+        band_pass = torch.where(
+            max_vals > 1e-5,
+            band_pass / (max_vals + 1e-6),
+            band_pass
+        )
         
         filters = band_pass.unsqueeze(1)  # [out_channels, 1, kernel_size]
 
@@ -714,7 +723,8 @@ def train_contrastive(cfg: Config):
     sinc_params = []
     other_params = []
     for name, param in model.named_parameters():
-        if 'features.0' in name:  # SincConv1d is the first layer in features
+        # More robust check: identify SincConv by checking for its specific parameter names
+        if 'low_hz' in name or 'band_hz' in name:
             sinc_params.append(param)
         else:
             other_params.append(param)
