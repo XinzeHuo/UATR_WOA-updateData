@@ -30,7 +30,11 @@ class Config:
 
     # 训练相关
     BATCH_SIZE = 16           # 实际 batch size = 16 identity，每个 identity 有两个 view
-    NUM_WORKERS = 4
+    MAX_NUM_WORKERS = 4
+    TORCH_NUM_THREADS = min(4, os.cpu_count() or 1)
+    TORCH_INTEROP_THREADS = 1
+    DATA_LOADER_TIMEOUT = 120
+    GPU_NUM_WORKERS = 0
     N_EPOCHS = 100
     LR = 1e-3
     WEIGHT_DECAY = 1e-4
@@ -42,26 +46,18 @@ class Config:
     CONTRASTIVE_TEMPERATURE = 0.1
     USE_SUPERVISED_CONTRASTIVE = False  # True 时利用类别标签做 supervised contrastive
 
-    # SincConv / 模型结构
-    SINC_NUM_FILTERS = 64
-    SINC_KERNEL_SIZE = 251
-    SINC_MIN_LOW_HZ = 30
-    SINC_MIN_BAND_HZ = 50
-
-    # 动态卷积
+    # 编码器结构
     DYN_HIDDEN_CHANNELS = 128
-    DYN_KERNEL_SIZE = 7
-    DYN_NUM_BASE_KERNELS = 4
+    CNN_BASE_DIVISOR = 4
+    CNN_MID_DIVISOR = 2
+    CNN_MIN_BASE_CHANNELS = 16
+    CNN_MIN_MID_CHANNELS = 32
 
     # 投影头维度
     EMBED_DIM = 128
     PROJ_DIM = 128
 
-    # 更丰富的编码器结构
-    RES_KERNEL_SIZE = 5
-    RES_DILATIONS = (1, 2, 4)
     DROPOUT = 0.1
-    SE_REDUCTION = 8
 
     # 数值稳定性
     MASK_VALUE_LIMIT = -1e9
@@ -89,6 +85,8 @@ def set_seed(seed: int = 2026):
     torch.cuda.manual_seed_all(seed)
 
 set_seed(2026)
+torch.set_num_threads(cfg.TORCH_NUM_THREADS)
+torch.set_num_interop_threads(cfg.TORCH_INTEROP_THREADS)
 
 
 # ======================
@@ -112,13 +110,27 @@ class WOAContrastiveDataset(Dataset):
         max_duration_sec: float = 10.0,
     ):
         super().__init__()
+        self._warned_paths: set = set()
+        self._sr_ratio_cache: Dict[int, float] = {}
+        if sample_rate <= 0:
+            raise ValueError(f"sample_rate must be positive, got {sample_rate}")
         self.sample_rate = sample_rate
         self.max_len = int(max_duration_sec * sample_rate)
+
+        csv_path = fix_path(csv_path)
+        if not os.path.exists(csv_path):
+            raise FileNotFoundError(f"WOA log CSV not found: {csv_path}")
 
         # 读取 CSV，自动识别分隔符
         self.df = pd.read_csv(csv_path, engine="python")
         # 如果分隔是制表符，可以改为:
         # self.df = pd.read_csv(csv_path, sep='\t')
+
+        required_cols = {"rel_path", "out_path"}
+        missing_cols = required_cols.difference(self.df.columns)
+        if missing_cols:
+            missing = ", ".join(sorted(missing_cols))
+            raise ValueError(f"Missing required columns in CSV: {missing}")
 
         # 过滤出对应 split（如 train）
         # 这里根据 rel_path 的前缀简单判断；若你在 log 中有单独的 split 列，可改用 split 列
@@ -154,8 +166,6 @@ class WOAContrastiveDataset(Dataset):
         # 把 id_to_class 映射成真正的 int label
         for _id in self.identities:
             self.id_to_class[_id] = self.class_map[self.id_to_class[_id]]
-
-        self._warned_paths: set = set()
 
         print(f"[WOAContrastiveDataset] loaded {len(self.df)} rows, {len(self.identities)} identities "
               f"with >= {min_samples_per_id} samples each.")
@@ -196,7 +206,30 @@ class WOAContrastiveDataset(Dataset):
 
     def _load_and_crop(self, wav_path: str) -> torch.Tensor:
         wav_path = fix_path(wav_path)
-        wav, sr = torchaudio.load(wav_path)
+        try:
+            info = torchaudio.info(wav_path)
+            sr = info.sample_rate
+            num_frames = info.num_frames
+            if num_frames is None:
+                raise RuntimeError(
+                    f"Audio file metadata incomplete: missing num_frames for {wav_path}. "
+                    "File may be corrupted or in an unsupported format."
+                )
+            target_frames = self.max_len
+            if sr != self.sample_rate:
+                key = (sr, self.sample_rate)
+                ratio = self._sr_ratio_cache.get(key)
+                if ratio is None:
+                    ratio = self.sample_rate / sr
+                    self._sr_ratio_cache[key] = ratio
+                target_frames = math.ceil(self.max_len / ratio)
+            if num_frames > target_frames:
+                start = random.randint(0, num_frames - target_frames)
+                wav, sr = torchaudio.load(wav_path, frame_offset=start, num_frames=target_frames)
+            else:
+                wav, sr = torchaudio.load(wav_path)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load audio: {wav_path}. {exc}") from exc
         wav = wav.to(torch.float32)
         if self.MONO:
             if wav.shape[0] > 1:
@@ -229,7 +262,7 @@ class WOAContrastiveDataset(Dataset):
 
     @property
     def MONO(self):
-        return True
+        return cfg.MONO
 
     def __getitem__(self, index):
         # index 是 identity 的索引
@@ -288,7 +321,9 @@ class SincConv1d(nn.Module):
         n_lin = torch.linspace(0, self.kernel_size - 1, steps=self.kernel_size)
         self.register_buffer("window", 0.54 - 0.46 * torch.cos(2 * math.pi * n_lin / (self.kernel_size - 1)))
         # 对称中心
-        self.register_buffer("n_0", torch.tensor((self.kernel_size - 1) / 2.0))
+        n_0 = (self.kernel_size - 1) / 2.0
+        self.register_buffer("n_0", torch.tensor(n_0))
+        self.register_buffer("n", torch.arange(self.kernel_size) - n_0)
 
 
     def forward(self, x):
@@ -306,20 +341,15 @@ class SincConv1d(nn.Module):
         high = high / (self.sample_rate / 2)
 
         # 构造时间轴
-        n = torch.arange(self.kernel_size, device=device) - self.n_0  # 中心对齐
+        n = self.n.to(device).unsqueeze(0)  # [1, kernel_size]
+        low = low.unsqueeze(1)  # [out_channels, 1]
+        high = high.unsqueeze(1)  # [out_channels, 1]
 
-        # sinc band-pass 滤波器
-        filters = []
-        for i in range(self.out_channels):
-            f1 = low[i]
-            f2 = high[i]
-            # 避免除 0
-            band_pass = (2 * f2 * self._sinc(2 * f2 * n) -
-                         2 * f1 * self._sinc(2 * f1 * n))
-            band_pass = band_pass * self.window.to(device)
-            filters.append(band_pass)
-
-        filters = torch.stack(filters, dim=0).unsqueeze(1)  # [out_channels, 1, kernel_size]
+        # sinc band-pass 滤波器（向量化）
+        band_pass = (2 * high * self._sinc(2 * high * n) -
+                     2 * low * self._sinc(2 * low * n))
+        band_pass = band_pass * self.window.to(device).unsqueeze(0)
+        filters = band_pass.unsqueeze(1)  # [out_channels, 1, kernel_size]
 
         return F.conv1d(x, filters, stride=1, padding=self.kernel_size // 2)
 
@@ -433,84 +463,38 @@ class SqueezeExcite1d(nn.Module):
 
 class PhyLDCEncoder(nn.Module):
     """
-    物理引导 + 轻量动态卷积 Encoder：
-      - SincConv 前端 (approx. Gabor/Sinc filters)
-      - 一些 1D 卷积 + DynamicConv block
+    轻量级 1D CNN Encoder（对比学习用）：
+      - 多层下采样卷积 + BN + ReLU
       - Global pooling 输出 embedding
     """
     def __init__(self,
-                 sample_rate: int = 16000,
-                 sinc_out_channels: int = 64,
-                 sinc_kernel_size: int = 251,
                  dyn_hidden_channels: int = 128,
-                 dyn_kernel_size: int = 7,
-                 dyn_num_kernels: int = 4,
                  embed_dim: int = 128,
-                 res_kernel_size: int = 5,
-                 res_dilations: Tuple[int, ...] = (1, 2, 4),
-                 dropout: float = 0.1,
-                 se_reduction: int = 8):
+                 dropout: float = 0.1):
         super().__init__()
-        if res_kernel_size % 2 == 0:
-            raise ValueError("res_kernel_size must be odd")
         if not 0 <= dropout <= 1:
             raise ValueError("dropout must be in [0, 1]")
-        if se_reduction <= 0:
-            raise ValueError("se_reduction must be positive")
+        if dyn_hidden_channels <= 0:
+            raise ValueError("dyn_hidden_channels must be positive")
+        if embed_dim <= 0:
+            raise ValueError("embed_dim must be positive")
 
-        self.sinc = SincConv1d(
-            out_channels=sinc_out_channels,
-            kernel_size=sinc_kernel_size,
-            sample_rate=sample_rate,
-            min_low_hz=cfg.SINC_MIN_LOW_HZ,
-            min_band_hz=cfg.SINC_MIN_BAND_HZ
-        )
-        self.bn1 = nn.BatchNorm1d(sinc_out_channels)
+        base_channels = max(cfg.CNN_MIN_BASE_CHANNELS, dyn_hidden_channels // cfg.CNN_BASE_DIVISOR)
+        mid_channels = max(cfg.CNN_MIN_MID_CHANNELS, dyn_hidden_channels // cfg.CNN_MID_DIVISOR)
 
-        # “TF 分离”可以简单用 depthwise + pointwise 来模拟
-        self.depthwise_conv = nn.Conv1d(
-            sinc_out_channels, sinc_out_channels,
-            kernel_size=5, padding=2, groups=sinc_out_channels
+        self.features = nn.Sequential(
+            nn.Conv1d(1, base_channels, kernel_size=7, stride=2, padding=3),
+            nn.BatchNorm1d(base_channels),
+            nn.ReLU(),
+            nn.Conv1d(base_channels, mid_channels, kernel_size=5, stride=2, padding=2),
+            nn.BatchNorm1d(mid_channels),
+            nn.ReLU(),
+            nn.Conv1d(mid_channels, dyn_hidden_channels, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm1d(dyn_hidden_channels),
+            nn.ReLU(),
         )
-        self.pointwise_conv = nn.Conv1d(
-            sinc_out_channels, dyn_hidden_channels,
-            kernel_size=1
-        )
-        self.bn2 = nn.BatchNorm1d(dyn_hidden_channels)
-        self.in_norm = nn.InstanceNorm1d(dyn_hidden_channels, affine=True)
-
-        self.temporal_blocks = nn.Sequential(
-            *[
-                TemporalResBlock(
-                    channels=dyn_hidden_channels,
-                    kernel_size=res_kernel_size,
-                    dilation=dilation,
-                    dropout=dropout
-                )
-                for dilation in res_dilations
-            ]
-        )
-        self.se = SqueezeExcite1d(dyn_hidden_channels, reduction=se_reduction)
-
-        # 动态卷积 block
-        self.dynamic_conv = DynamicConv1d(
-            in_channels=dyn_hidden_channels,
-            out_channels=dyn_hidden_channels,
-            kernel_size=dyn_kernel_size,
-            num_kernels=dyn_num_kernels,
-            stride=1,
-            padding=dyn_kernel_size // 2
-        )
-        self.bn3 = nn.BatchNorm1d(dyn_hidden_channels)
-
-        # 再来一个简洁的卷积 block
-        self.conv_final = nn.Conv1d(
-            dyn_hidden_channels, dyn_hidden_channels,
-            kernel_size=3, padding=1
-        )
-        self.bn4 = nn.BatchNorm1d(dyn_hidden_channels)
-
-        # 最终 embedding 的线性变换
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.dropout = nn.Dropout(dropout)
         self.fc = nn.Linear(dyn_hidden_channels, embed_dim)
 
     def forward(self, x):
@@ -518,30 +502,10 @@ class PhyLDCEncoder(nn.Module):
         x: [B, 1, T] waveform
         输出: [B, embed_dim]
         """
-        # Sinc 前端
-        x = self.sinc(x)                   # [B, C_sinc, T]
-        x = self.bn1(torch.abs(x))         # 取振幅再做 BN，可以看成类似能量包络
-
-        # TF-like block: depthwise + pointwise
-        x = F.relu(self.depthwise_conv(x))
-        x = self.pointwise_conv(x)
-        x = F.relu(self.in_norm(self.bn2(x)))   # [B, C_hidden, T]
-
-        x = self.temporal_blocks(x)
-        x = self.se(x)
-
-        # Dynamic Conv block
-        x = F.relu(self.bn3(self.dynamic_conv(x)))     # [B, C_hidden, T]
-
-        # 最后一个卷积
-        x = F.relu(self.bn4(self.conv_final(x)))       # [B, C_hidden, T]
-
-        # Global pooling（时序池化）
-        x = F.adaptive_avg_pool1d(x, 1).squeeze(-1)    # [B, C_hidden]
-
-        # 线性映射到 embedding
-        z = self.fc(x)                                 # [B, embed_dim]
-        return z
+        x = self.features(x)
+        x = self.pool(x).squeeze(-1)
+        x = self.dropout(x)
+        return self.fc(x)
 
 
 # ======================
@@ -571,17 +535,9 @@ class ContrastiveModel(nn.Module):
     def __init__(self, cfg: Config):
         super().__init__()
         self.encoder = PhyLDCEncoder(
-            sample_rate=cfg.SAMPLE_RATE,
-            sinc_out_channels=cfg.SINC_NUM_FILTERS,
-            sinc_kernel_size=cfg.SINC_KERNEL_SIZE,
             dyn_hidden_channels=cfg.DYN_HIDDEN_CHANNELS,
-            dyn_kernel_size=cfg.DYN_KERNEL_SIZE,
-            dyn_num_kernels=cfg.DYN_NUM_BASE_KERNELS,
             embed_dim=cfg.EMBED_DIM,
-            res_kernel_size=cfg.RES_KERNEL_SIZE,
-            res_dilations=cfg.RES_DILATIONS,
-            dropout=cfg.DROPOUT,
-            se_reduction=cfg.SE_REDUCTION
+            dropout=cfg.DROPOUT
         )
         self.proj = ProjectionHead(cfg.EMBED_DIM, cfg.PROJ_DIM)
 
@@ -658,24 +614,38 @@ def contrastive_loss_nt_xent(z1, z2, temperature: float = 0.1):
 
 def train_contrastive(cfg: Config):
     # Dataset & DataLoader
+    csv_path = fix_path(cfg.WOA_LOG_CSV)
+    if not os.path.exists(csv_path):
+        raise FileNotFoundError(f"WOA log CSV not found: {csv_path}")
+
+    min_samples_per_id = 2
     dataset = WOAContrastiveDataset(
-        csv_path=cfg.WOA_LOG_CSV,
+        csv_path=csv_path,
         split_prefix="train",
-        min_samples_per_id=2,
+        min_samples_per_id=min_samples_per_id,
         sample_rate=cfg.SAMPLE_RATE,
         max_duration_sec=cfg.MAX_DURATION_SEC,
     )
+    if len(dataset) == 0:
+        raise ValueError(
+            f"No valid identities found in CSV: {csv_path} "
+            f"(requires min {min_samples_per_id} samples per identity)"
+        )
+
+    device = torch.device(cfg.DEVICE)
+    print(f"Using device: {device}")
+    cpu_workers = min(cfg.MAX_NUM_WORKERS, os.cpu_count() or 1)
+    num_workers = cfg.GPU_NUM_WORKERS if device.type == "cuda" else cpu_workers
+
     loader = DataLoader(
         dataset,
         batch_size=cfg.BATCH_SIZE,
         shuffle=True,
-        num_workers=cfg.NUM_WORKERS,
-        pin_memory=True,
-        drop_last=True
+        num_workers=num_workers,
+        pin_memory=device.type == "cuda",
+        drop_last=True,
+        timeout=cfg.DATA_LOADER_TIMEOUT if num_workers > 0 else 0
     )
-
-    device = torch.device(cfg.DEVICE)
-    print(f"Using device: {device}")
 
     model = ContrastiveModel(cfg).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
