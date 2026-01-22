@@ -65,6 +65,8 @@ CONFIG = {
     "target_len": 938,  # Align to ~30s
     "woa_encoder_ckpt": "./encoder_contrastive_woa.pt",
     "woa_freeze": True,
+    "woa_duration_default": 10.0,
+    "woa_test_split": "test",
 
     # 双分辨率配置
     "fft_high": 4096, "hop_high": 512, "mels_high": 128,  # 流1: 高频分辨率
@@ -147,7 +149,7 @@ class ShipsEarDualDataset(Dataset):
         self.spec_aug = SpecAugment() if split == 'train' else None
         woa_cfg = woa_cfg or {}
         self.woa_sample_rate = int(woa_cfg.get("SAMPLE_RATE", config["sample_rate"]))
-        self.woa_duration = float(woa_cfg.get("MAX_DURATION_SEC", 10.0))
+        self.woa_duration = float(woa_cfg.get("MAX_DURATION_SEC", config["woa_duration_default"]))
         self.woa_target_len = int(self.woa_sample_rate * self.woa_duration)
 
         for fpath in glob.glob(os.path.join(root_dir, split, "**", "*.wav"), recursive=True):
@@ -349,7 +351,11 @@ def main():
 
     # 1. Dataset
     if not os.path.exists(CONFIG['woa_encoder_ckpt']):
-        log(f"Error: WOA encoder checkpoint not found: {CONFIG['woa_encoder_ckpt']}")
+        log(
+            "Error: WOA encoder checkpoint not found at "
+            f"{CONFIG['woa_encoder_ckpt']}. Please ensure the contrastive training "
+            "has been completed and the checkpoint exists."
+        )
         return
     woa_ckpt = torch.load(CONFIG['woa_encoder_ckpt'], map_location='cpu')
     woa_cfg = woa_ckpt.get("cfg", {})
@@ -532,7 +538,13 @@ def main():
 
             with torch.no_grad():
                 with autocast():
-                    woa_wave = prepare_woa_waveform(pad_y, sr, train_ds.woa_sample_rate, train_ds.woa_target_len, "test")
+                    woa_wave = prepare_woa_waveform(
+                        pad_y,
+                        sr,
+                        train_ds.woa_sample_rate,
+                        train_ds.woa_target_len,
+                        CONFIG["woa_test_split"]
+                    )
                     woa_feat = woa_encoder(woa_wave.unsqueeze(0).to(CONFIG['device']))
                     feat = model(
                         s1.unsqueeze(0).to(CONFIG['device']),

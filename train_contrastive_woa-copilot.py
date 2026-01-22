@@ -560,7 +560,8 @@ class ContrastiveModel(nn.Module):
 # ======================
 
 def _validate_temperature(temperature: float) -> None:
-    _validate_temperature(temperature)
+    if temperature < cfg.MIN_TEMPERATURE:
+        raise ValueError(f"temperature must be >= {cfg.MIN_TEMPERATURE}")
 
 
 def contrastive_loss_nt_xent(z1, z2, temperature: float = 0.1):
@@ -571,8 +572,7 @@ def contrastive_loss_nt_xent(z1, z2, temperature: float = 0.1):
     输出:
       标量 loss
     """
-    if temperature < cfg.MIN_TEMPERATURE:
-        raise ValueError(f"temperature must be >= {cfg.MIN_TEMPERATURE}")
+    _validate_temperature(temperature)
     batch_size = z1.size(0)
 
     # L2 normalize
