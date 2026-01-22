@@ -45,7 +45,7 @@ class Config:
 
     # 对比学习
     CONTRASTIVE_TEMPERATURE = 0.1
-    USE_SUPERVISED_CONTRASTIVE = True  # True 时利用类别标签做 supervised contrastive
+    USE_SUPERVISED_CONTRASTIVE = True  # 可切换以比较无监督与监督对比学习效果
     GRAD_CLIP_NORM = 1.0
 
     # 编码器结构
@@ -705,6 +705,7 @@ def train_contrastive(cfg: Config):
         for step, (wav1, wav2, cls) in enumerate(pbar, start=1):
             wav1 = wav1.to(device)  # [B, 1, T]
             wav2 = wav2.to(device)
+            cls = cls.to(device)
 
             _, z1 = model(wav1)   # (encoder_z1, proj_z1)，这里我们只要 proj 输出参与 loss
             _, z2 = model(wav2)
@@ -716,7 +717,7 @@ def train_contrastive(cfg: Config):
 
             if cfg.USE_SUPERVISED_CONTRASTIVE:
                 loss = contrastive_loss_supervised(
-                    z1, z2, cls.to(device), temperature=cfg.CONTRASTIVE_TEMPERATURE
+                    z1, z2, cls, temperature=cfg.CONTRASTIVE_TEMPERATURE
                 )
             else:
                 loss = contrastive_loss_nt_xent(z1, z2, temperature=cfg.CONTRASTIVE_TEMPERATURE)

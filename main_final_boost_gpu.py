@@ -31,7 +31,7 @@ def prepare_woa_waveform(y, sr, target_sr, target_len, split):
             y = y[:target_len]
     wav = torch.tensor(y, dtype=torch.float32).unsqueeze(0)
     max_abs = wav.abs().max()
-    if max_abs > 1e-6 and max_abs > 1.0:
+    if max_abs > 1.0:
         wav = wav / (max_abs + 1e-6)
     return wav
 
