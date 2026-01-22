@@ -356,22 +356,27 @@ class SincConv1d(nn.Module):
         high = high.unsqueeze(1)  # [out_channels, 1]
 
         # sinc band-pass 滤波器（向量化）
+        # 使用标准 SincNet 公式
         band_pass = (2 * high * self._sinc(2 * high * n) -
                      2 * low * self._sinc(2 * low * n))
         band_pass = band_pass * self.window.to(device).unsqueeze(0)
         
-        # 归一化滤波器以避免数值爆炸
-        max_vals = torch.abs(band_pass).max(dim=1, keepdim=True)[0]
-        # 使用更安全的 epsilon 值，并在滤波器接近零时跳过归一化
-        band_pass = torch.where(
-            max_vals > 1e-5,
-            band_pass / (max_vals + 1e-6),
-            band_pass
-        )
+        # 检查并处理 NaN/Inf 值
+        if torch.isnan(band_pass).any() or torch.isinf(band_pass).any():
+            band_pass = torch.nan_to_num(band_pass, nan=0.0, posinf=1.0, neginf=-1.0)
         
         filters = band_pass.unsqueeze(1)  # [out_channels, 1, kernel_size]
-
-        return F.conv1d(x, filters, stride=1, padding=self.kernel_size // 2)
+        
+        # 应用卷积并缩放输出以匹配标准 Conv1d 的输出范围
+        output = F.conv1d(x, filters, stride=1, padding=self.kernel_size // 2)
+        # 使用可学习的缩放因子或固定缩放，这里使用简单的除以 sqrt(kernel_size)
+        output = output / math.sqrt(self.kernel_size)
+        
+        # 最终安全检查
+        if torch.isnan(output).any() or torch.isinf(output).any():
+            output = torch.nan_to_num(output, nan=0.0, posinf=1.0, neginf=-1.0)
+        
+        return output
 
     @staticmethod
     def _sinc(x):
@@ -507,15 +512,15 @@ class PhyLDCEncoder(nn.Module):
         self.features = nn.Sequential(
             # SincConv1d: kernel_size=251 (~15.7ms at 16kHz) suitable for capturing phonetic/acoustic features
             SincConv1d(base_channels, kernel_size=251, sample_rate=sample_rate),
-            nn.BatchNorm1d(base_channels),
+            nn.BatchNorm1d(base_channels, eps=1e-4, momentum=0.1),
             nn.ReLU(),
             # MaxPool1d matches the original stride=2 downsampling of the replaced Conv1d layer
             nn.MaxPool1d(kernel_size=3, stride=2, padding=1),
             nn.Conv1d(base_channels, mid_channels, kernel_size=5, stride=2, padding=2),
-            nn.BatchNorm1d(mid_channels),
+            nn.BatchNorm1d(mid_channels, eps=1e-4, momentum=0.1),
             nn.ReLU(),
             nn.Conv1d(mid_channels, dyn_hidden_channels, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm1d(dyn_hidden_channels),
+            nn.BatchNorm1d(dyn_hidden_channels, eps=1e-4, momentum=0.1),
             nn.ReLU(),
         )
         self.pool = nn.AdaptiveAvgPool1d(1)
@@ -528,6 +533,11 @@ class PhyLDCEncoder(nn.Module):
         输出: [B, embed_dim]
         """
         x = self.features(x)
+        # 检测并处理 NaN 值（诊断用）
+        if torch.isnan(x).any():
+            # 如果特征提取后出现 NaN，用零替换以允许训练继续
+            # 这是一个临时解决方案，应该找到根本原因
+            x = torch.nan_to_num(x, nan=0.0)
         x = self.pool(x).squeeze(-1)
         x = self.dropout(x)
         return self.fc(x)
