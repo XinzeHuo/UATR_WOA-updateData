@@ -210,9 +210,11 @@ class WOAContrastiveDataset(Dataset):
         try:
             info = torchaudio.info(wav_path)
             sr = info.sample_rate
-            num_frames = info.num_frames or 0
+            if info.num_frames is None:
+                raise RuntimeError(f"Missing frame count for audio: {wav_path}")
+            num_frames = info.num_frames
             target_frames = self.max_len
-            if sr and sr != self.sample_rate:
+            if sr is not None and sr != self.sample_rate:
                 target_frames = int(math.ceil(self.max_len * sr / self.sample_rate))
             if num_frames > target_frames:
                 start = random.randint(0, num_frames - target_frames)
@@ -330,7 +332,7 @@ class SincConv1d(nn.Module):
         high = high / (self.sample_rate / 2)
 
         # 构造时间轴
-        n = torch.arange(self.kernel_size, device=device) - self.n_0.to(device)  # 中心对齐
+        n = torch.arange(self.kernel_size, device=device) - self.n_0  # 中心对齐
         n = n.unsqueeze(0)  # [1, kernel_size]
         low = low.unsqueeze(1)  # [out_channels, 1]
         high = high.unsqueeze(1)
