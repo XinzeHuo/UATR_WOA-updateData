@@ -48,8 +48,6 @@ class Config:
 
     # 编码器结构
     DYN_HIDDEN_CHANNELS = 128
-    DYN_KERNEL_SIZE = 7
-    DYN_NUM_BASE_KERNELS = 4
     CNN_BASE_DIVISOR = 4
     CNN_MID_DIVISOR = 2
     CNN_MIN_BASE_CHANNELS = 16
