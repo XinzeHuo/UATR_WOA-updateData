@@ -69,6 +69,7 @@ class Config:
     MIN_SE_HIDDEN = 8
     WAVEFORM_MAX_ABS = 1.0
     MAX_NONFINITE_WARNINGS = 5
+    DEBUG_NAN_CHECKS = True  # 设为 False 可在生产环境中禁用 NaN 检查以提高性能
 
 
 cfg = Config()
@@ -361,8 +362,8 @@ class SincConv1d(nn.Module):
                      2 * low * self._sinc(2 * low * n))
         band_pass = band_pass * self.window.to(device).unsqueeze(0)
         
-        # 检查并处理 NaN/Inf 值
-        if torch.isnan(band_pass).any() or torch.isinf(band_pass).any():
+        # 检查并处理 NaN/Inf 值（可通过 cfg.DEBUG_NAN_CHECKS 禁用）
+        if cfg.DEBUG_NAN_CHECKS and not torch.isfinite(band_pass).all():
             band_pass = torch.nan_to_num(band_pass, nan=0.0, posinf=1.0, neginf=-1.0)
         
         filters = band_pass.unsqueeze(1)  # [out_channels, 1, kernel_size]
@@ -373,7 +374,7 @@ class SincConv1d(nn.Module):
         output = output / math.sqrt(self.kernel_size)
         
         # 最终安全检查
-        if torch.isnan(output).any() or torch.isinf(output).any():
+        if cfg.DEBUG_NAN_CHECKS and not torch.isfinite(output).all():
             output = torch.nan_to_num(output, nan=0.0, posinf=1.0, neginf=-1.0)
         
         return output
@@ -533,10 +534,9 @@ class PhyLDCEncoder(nn.Module):
         输出: [B, embed_dim]
         """
         x = self.features(x)
-        # 检测并处理 NaN 值（诊断用）
-        if torch.isnan(x).any():
-            # 如果特征提取后出现 NaN，用零替换以允许训练继续
-            # 这是一个临时解决方案，应该找到根本原因
+        # 检测并处理 NaN 值（可通过 cfg.DEBUG_NAN_CHECKS 禁用）
+        if cfg.DEBUG_NAN_CHECKS and not torch.isfinite(x).all():
+            # 如果特征提取后出现 NaN，用零替换
             x = torch.nan_to_num(x, nan=0.0)
         x = self.pool(x).squeeze(-1)
         x = self.dropout(x)
