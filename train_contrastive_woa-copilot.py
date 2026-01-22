@@ -471,9 +471,8 @@ class SqueezeExcite1d(nn.Module):
 
 class PhyLDCEncoder(nn.Module):
     """
-    物理引导 + 轻量动态卷积 Encoder：
-      - SincConv 前端 (approx. Gabor/Sinc filters)
-      - 一些 1D 卷积 + DynamicConv block
+    轻量级 1D CNN Encoder（对比学习用）：
+      - 多层下采样卷积 + BN + ReLU
       - Global pooling 输出 embedding
     """
     def __init__(self,
@@ -489,66 +488,27 @@ class PhyLDCEncoder(nn.Module):
                  dropout: float = 0.1,
                  se_reduction: int = 8):
         super().__init__()
-        if res_kernel_size % 2 == 0:
-            raise ValueError("res_kernel_size must be odd")
         if not 0 <= dropout <= 1:
             raise ValueError("dropout must be in [0, 1]")
-        if se_reduction <= 0:
-            raise ValueError("se_reduction must be positive")
+        if dyn_hidden_channels <= 0:
+            raise ValueError("dyn_hidden_channels must be positive")
 
-        self.sinc = SincConv1d(
-            out_channels=sinc_out_channels,
-            kernel_size=sinc_kernel_size,
-            sample_rate=sample_rate,
-            min_low_hz=cfg.SINC_MIN_LOW_HZ,
-            min_band_hz=cfg.SINC_MIN_BAND_HZ
-        )
-        self.bn1 = nn.BatchNorm1d(sinc_out_channels)
+        base_channels = max(16, dyn_hidden_channels // 4)
+        mid_channels = max(32, dyn_hidden_channels // 2)
 
-        # “TF 分离”可以简单用 depthwise + pointwise 来模拟
-        self.depthwise_conv = nn.Conv1d(
-            sinc_out_channels, sinc_out_channels,
-            kernel_size=5, padding=2, groups=sinc_out_channels
+        self.features = nn.Sequential(
+            nn.Conv1d(1, base_channels, kernel_size=7, stride=2, padding=3),
+            nn.BatchNorm1d(base_channels),
+            nn.ReLU(),
+            nn.Conv1d(base_channels, mid_channels, kernel_size=5, stride=2, padding=2),
+            nn.BatchNorm1d(mid_channels),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Conv1d(mid_channels, dyn_hidden_channels, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm1d(dyn_hidden_channels),
+            nn.ReLU(),
         )
-        self.pointwise_conv = nn.Conv1d(
-            sinc_out_channels, dyn_hidden_channels,
-            kernel_size=1
-        )
-        self.bn2 = nn.BatchNorm1d(dyn_hidden_channels)
-        self.in_norm = nn.InstanceNorm1d(dyn_hidden_channels, affine=True)
-
-        self.temporal_blocks = nn.Sequential(
-            *[
-                TemporalResBlock(
-                    channels=dyn_hidden_channels,
-                    kernel_size=res_kernel_size,
-                    dilation=dilation,
-                    dropout=dropout
-                )
-                for dilation in res_dilations
-            ]
-        )
-        self.se = SqueezeExcite1d(dyn_hidden_channels, reduction=se_reduction)
-
-        # 动态卷积 block
-        self.dynamic_conv = DynamicConv1d(
-            in_channels=dyn_hidden_channels,
-            out_channels=dyn_hidden_channels,
-            kernel_size=dyn_kernel_size,
-            num_kernels=dyn_num_kernels,
-            stride=1,
-            padding=dyn_kernel_size // 2
-        )
-        self.bn3 = nn.BatchNorm1d(dyn_hidden_channels)
-
-        # 再来一个简洁的卷积 block
-        self.conv_final = nn.Conv1d(
-            dyn_hidden_channels, dyn_hidden_channels,
-            kernel_size=3, padding=1
-        )
-        self.bn4 = nn.BatchNorm1d(dyn_hidden_channels)
-
-        # 最终 embedding 的线性变换
+        self.pool = nn.AdaptiveAvgPool1d(1)
         self.fc = nn.Linear(dyn_hidden_channels, embed_dim)
 
     def forward(self, x):
@@ -556,30 +516,9 @@ class PhyLDCEncoder(nn.Module):
         x: [B, 1, T] waveform
         输出: [B, embed_dim]
         """
-        # Sinc 前端
-        x = self.sinc(x)                   # [B, C_sinc, T]
-        x = self.bn1(torch.abs(x))         # 取振幅再做 BN，可以看成类似能量包络
-
-        # TF-like block: depthwise + pointwise
-        x = F.relu(self.depthwise_conv(x))
-        x = self.pointwise_conv(x)
-        x = F.relu(self.in_norm(self.bn2(x)))   # [B, C_hidden, T]
-
-        x = self.temporal_blocks(x)
-        x = self.se(x)
-
-        # Dynamic Conv block
-        x = F.relu(self.bn3(self.dynamic_conv(x)))     # [B, C_hidden, T]
-
-        # 最后一个卷积
-        x = F.relu(self.bn4(self.conv_final(x)))       # [B, C_hidden, T]
-
-        # Global pooling（时序池化）
-        x = F.adaptive_avg_pool1d(x, 1).squeeze(-1)    # [B, C_hidden]
-
-        # 线性映射到 embedding
-        z = self.fc(x)                                 # [B, embed_dim]
-        return z
+        x = self.features(x)
+        x = self.pool(x).squeeze(-1)
+        return self.fc(x)
 
 
 # ======================
