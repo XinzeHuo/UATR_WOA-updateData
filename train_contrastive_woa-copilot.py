@@ -208,7 +208,17 @@ class WOAContrastiveDataset(Dataset):
     def _load_and_crop(self, wav_path: str) -> torch.Tensor:
         wav_path = fix_path(wav_path)
         try:
-            wav, sr = torchaudio.load(wav_path)
+            info = torchaudio.info(wav_path)
+            sr = info.sample_rate
+            num_frames = info.num_frames or 0
+            target_frames = self.max_len
+            if sr and sr != self.sample_rate:
+                target_frames = int(math.ceil(self.max_len * sr / self.sample_rate))
+            if num_frames > target_frames:
+                start = random.randint(0, num_frames - target_frames)
+                wav, sr = torchaudio.load(wav_path, frame_offset=start, num_frames=target_frames)
+            else:
+                wav, sr = torchaudio.load(wav_path)
         except Exception as exc:
             raise RuntimeError(f"Failed to load audio: {wav_path}. {exc}") from exc
         wav = wav.to(torch.float32)
@@ -320,20 +330,16 @@ class SincConv1d(nn.Module):
         high = high / (self.sample_rate / 2)
 
         # 构造时间轴
-        n = torch.arange(self.kernel_size, device=device) - self.n_0  # 中心对齐
+        n = torch.arange(self.kernel_size, device=device) - self.n_0.to(device)  # 中心对齐
+        n = n.unsqueeze(0)  # [1, kernel_size]
+        low = low.unsqueeze(1)  # [out_channels, 1]
+        high = high.unsqueeze(1)
 
-        # sinc band-pass 滤波器
-        filters = []
-        for i in range(self.out_channels):
-            f1 = low[i]
-            f2 = high[i]
-            # 避免除 0
-            band_pass = (2 * f2 * self._sinc(2 * f2 * n) -
-                         2 * f1 * self._sinc(2 * f1 * n))
-            band_pass = band_pass * self.window.to(device)
-            filters.append(band_pass)
-
-        filters = torch.stack(filters, dim=0).unsqueeze(1)  # [out_channels, 1, kernel_size]
+        # sinc band-pass 滤波器（向量化）
+        band_pass = (2 * high * self._sinc(2 * high * n) -
+                     2 * low * self._sinc(2 * low * n))
+        band_pass = band_pass * self.window.to(device).unsqueeze(0)
+        filters = band_pass.unsqueeze(1)  # [out_channels, 1, kernel_size]
 
         return F.conv1d(x, filters, stride=1, padding=self.kernel_size // 2)
 
