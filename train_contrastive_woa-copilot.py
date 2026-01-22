@@ -56,6 +56,8 @@ class Config:
     DYN_HIDDEN_CHANNELS = 128
     DYN_KERNEL_SIZE = 7
     DYN_NUM_BASE_KERNELS = 4
+    CNN_MIN_BASE_CHANNELS = 16
+    CNN_MIN_MID_CHANNELS = 32
 
     # 投影头维度
     EMBED_DIM = 128
@@ -484,9 +486,11 @@ class PhyLDCEncoder(nn.Module):
             raise ValueError("dropout must be in [0, 1]")
         if dyn_hidden_channels <= 0:
             raise ValueError("dyn_hidden_channels must be positive")
+        if embed_dim <= 0:
+            raise ValueError("embed_dim must be positive")
 
-        base_channels = max(16, dyn_hidden_channels // 4)
-        mid_channels = max(32, dyn_hidden_channels // 2)
+        base_channels = max(cfg.CNN_MIN_BASE_CHANNELS, dyn_hidden_channels // 4)
+        mid_channels = max(cfg.CNN_MIN_MID_CHANNELS, dyn_hidden_channels // 2)
 
         self.features = nn.Sequential(
             nn.Conv1d(1, base_channels, kernel_size=7, stride=2, padding=3),
