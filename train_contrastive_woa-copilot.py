@@ -115,6 +115,8 @@ class WOAContrastiveDataset(Dataset):
     ):
         super().__init__()
         self._warned_paths: set = set()
+        if sample_rate <= 0:
+            raise ValueError(f"sample_rate must be positive, got {sample_rate}")
         self.sample_rate = sample_rate
         self.max_len = int(max_duration_sec * sample_rate)
 
@@ -334,7 +336,7 @@ class SincConv1d(nn.Module):
         # 构造时间轴
         n = (torch.arange(self.kernel_size, device=device) - self.n_0).view(1, -1)  # [1, kernel_size]
         low = low.view(-1, 1)  # [out_channels, 1]
-        high = high.view(-1, 1)
+        high = high.view(-1, 1)  # [out_channels, 1]
 
         # sinc band-pass 滤波器（向量化）
         band_pass = (2 * high * self._sinc(2 * high * n) -
