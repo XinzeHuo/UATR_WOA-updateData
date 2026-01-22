@@ -476,17 +476,9 @@ class PhyLDCEncoder(nn.Module):
       - Global pooling 输出 embedding
     """
     def __init__(self,
-                 sample_rate: int = 16000,
-                 sinc_out_channels: int = 64,
-                 sinc_kernel_size: int = 251,
                  dyn_hidden_channels: int = 128,
-                 dyn_kernel_size: int = 7,
-                 dyn_num_kernels: int = 4,
                  embed_dim: int = 128,
-                 res_kernel_size: int = 5,
-                 res_dilations: Tuple[int, ...] = (1, 2, 4),
-                 dropout: float = 0.1,
-                 se_reduction: int = 8):
+                 dropout: float = 0.1):
         super().__init__()
         if not 0 <= dropout <= 1:
             raise ValueError("dropout must be in [0, 1]")
@@ -503,12 +495,12 @@ class PhyLDCEncoder(nn.Module):
             nn.Conv1d(base_channels, mid_channels, kernel_size=5, stride=2, padding=2),
             nn.BatchNorm1d(mid_channels),
             nn.ReLU(),
-            nn.Dropout(dropout),
             nn.Conv1d(mid_channels, dyn_hidden_channels, kernel_size=3, stride=2, padding=1),
             nn.BatchNorm1d(dyn_hidden_channels),
             nn.ReLU(),
         )
         self.pool = nn.AdaptiveAvgPool1d(1)
+        self.dropout = nn.Dropout(dropout)
         self.fc = nn.Linear(dyn_hidden_channels, embed_dim)
 
     def forward(self, x):
@@ -518,6 +510,7 @@ class PhyLDCEncoder(nn.Module):
         """
         x = self.features(x)
         x = self.pool(x).squeeze(-1)
+        x = self.dropout(x)
         return self.fc(x)
 
 
@@ -548,17 +541,9 @@ class ContrastiveModel(nn.Module):
     def __init__(self, cfg: Config):
         super().__init__()
         self.encoder = PhyLDCEncoder(
-            sample_rate=cfg.SAMPLE_RATE,
-            sinc_out_channels=cfg.SINC_NUM_FILTERS,
-            sinc_kernel_size=cfg.SINC_KERNEL_SIZE,
             dyn_hidden_channels=cfg.DYN_HIDDEN_CHANNELS,
-            dyn_kernel_size=cfg.DYN_KERNEL_SIZE,
-            dyn_num_kernels=cfg.DYN_NUM_BASE_KERNELS,
             embed_dim=cfg.EMBED_DIM,
-            res_kernel_size=cfg.RES_KERNEL_SIZE,
-            res_dilations=cfg.RES_DILATIONS,
-            dropout=cfg.DROPOUT,
-            se_reduction=cfg.SE_REDUCTION
+            dropout=cfg.DROPOUT
         )
         self.proj = ProjectionHead(cfg.EMBED_DIM, cfg.PROJ_DIM)
 
