@@ -564,6 +564,12 @@ def _validate_temperature(temperature: float) -> None:
         raise ValueError(f"temperature must be >= {cfg.MIN_TEMPERATURE}")
 
 
+def _mask_logits(logits: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    mask_floor = torch.finfo(logits.dtype).min
+    mask_value = cfg.MASK_VALUE_LIMIT if mask_floor < cfg.MASK_VALUE_LIMIT else mask_floor
+    return logits.masked_fill(mask, mask_value)
+
+
 def contrastive_loss_nt_xent(z1, z2, temperature: float = 0.1):
     """
     SimCLR 风格的 NT-Xent loss（无标签版，只有 "同索引" 为正样本）。
@@ -597,10 +603,7 @@ def contrastive_loss_nt_xent(z1, z2, temperature: float = 0.1):
         pos_mask[i + batch_size, i] = True
 
     # logits
-    logits = similarity_matrix / temperature
-    mask_floor = torch.finfo(logits.dtype).min
-    mask_value = cfg.MASK_VALUE_LIMIT if mask_floor < cfg.MASK_VALUE_LIMIT else mask_floor
-    logits = logits.masked_fill(mask, mask_value)  # 忽略自己
+    logits = _mask_logits(similarity_matrix / temperature, mask)  # 忽略自己
 
     # 对每个样本，只有一个正样本
     # log( exp(sim(pos)/temp) / sum(exp(sim(all)/temp)) )
@@ -635,9 +638,7 @@ def contrastive_loss_supervised(z1, z2, labels, temperature: float = 0.1):
 
     logits = torch.matmul(z, z.t()) / temperature
     mask = torch.eye(2 * batch_size, dtype=torch.bool, device=z.device)
-    mask_floor = torch.finfo(logits.dtype).min
-    mask_value = cfg.MASK_VALUE_LIMIT if mask_floor < cfg.MASK_VALUE_LIMIT else mask_floor
-    logits = logits.masked_fill(mask, mask_value)
+    logits = _mask_logits(logits, mask)
 
     pos_mask = labels.unsqueeze(0) == labels.unsqueeze(1)
     pos_mask = pos_mask & ~mask
@@ -722,7 +723,7 @@ def train_contrastive(cfg: Config):
 
             optimizer.zero_grad()
             loss.backward()
-            if cfg.GRAD_CLIP_NORM:
+            if cfg.GRAD_CLIP_NORM > 0:
                 nn.utils.clip_grad_norm_(model.parameters(), cfg.GRAD_CLIP_NORM)
             optimizer.step()
 

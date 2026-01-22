@@ -31,9 +31,15 @@ def prepare_woa_waveform(y, sr, target_sr, target_len, split):
             y = y[:target_len]
     wav = torch.tensor(y, dtype=torch.float32).unsqueeze(0)
     max_abs = wav.abs().max()
-    if max_abs > 1.0:
+    if max_abs > 1e-6 and max_abs > 1.0:
         wav = wav / (max_abs + 1e-6)
     return wav
+
+
+def _resolve_woa_setting(woa_cfg, config, key, default_key):
+    if key in woa_cfg:
+        return woa_cfg[key]
+    return config[default_key]
 
 
 # ================= 0. 日志与工具 =================
@@ -148,8 +154,8 @@ class ShipsEarDualDataset(Dataset):
         self.labels = []
         self.spec_aug = SpecAugment() if split == 'train' else None
         woa_cfg = woa_cfg or {}
-        self.woa_sample_rate = int(woa_cfg.get("SAMPLE_RATE", config["sample_rate"]))
-        self.woa_duration = float(woa_cfg.get("MAX_DURATION_SEC", config["woa_duration_default"]))
+        self.woa_sample_rate = int(_resolve_woa_setting(woa_cfg, config, "SAMPLE_RATE", "sample_rate"))
+        self.woa_duration = float(_resolve_woa_setting(woa_cfg, config, "MAX_DURATION_SEC", "woa_duration_default"))
         self.woa_target_len = int(self.woa_sample_rate * self.woa_duration)
 
         for fpath in glob.glob(os.path.join(root_dir, split, "**", "*.wav"), recursive=True):
