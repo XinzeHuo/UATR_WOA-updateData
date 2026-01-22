@@ -31,6 +31,8 @@ class Config:
     # 训练相关
     BATCH_SIZE = 16           # 实际 batch size = 16 identity，每个 identity 有两个 view
     MAX_NUM_WORKERS = 4
+    TORCH_NUM_THREADS = min(4, os.cpu_count() or 1)
+    TORCH_INTEROP_THREADS = 1
     DATA_LOADER_TIMEOUT = 120
     GPU_NUM_WORKERS = 0
     N_EPOCHS = 100
@@ -91,6 +93,8 @@ def set_seed(seed: int = 2026):
     torch.cuda.manual_seed_all(seed)
 
 set_seed(2026)
+torch.set_num_threads(cfg.TORCH_NUM_THREADS)
+torch.set_num_interop_threads(cfg.TORCH_INTEROP_THREADS)
 
 
 # ======================
@@ -221,8 +225,12 @@ class WOAContrastiveDataset(Dataset):
                 )
             target_frames = self.max_len
             if sr != self.sample_rate:
-                ratio = self._sr_ratio_cache.setdefault(sr, sr / self.sample_rate)
-                target_frames = math.ceil(self.max_len * ratio)
+                key = (sr, self.sample_rate)
+                ratio = self._sr_ratio_cache.get(key)
+                if ratio is None:
+                    ratio = self.sample_rate / sr
+                    self._sr_ratio_cache[key] = ratio
+                target_frames = math.ceil(self.max_len / ratio)
             if num_frames > target_frames:
                 start = random.randint(0, num_frames - target_frames)
                 wav, sr = torchaudio.load(wav_path, frame_offset=start, num_frames=target_frames)
@@ -321,7 +329,9 @@ class SincConv1d(nn.Module):
         n_lin = torch.linspace(0, self.kernel_size - 1, steps=self.kernel_size)
         self.register_buffer("window", 0.54 - 0.46 * torch.cos(2 * math.pi * n_lin / (self.kernel_size - 1)))
         # 对称中心
-        self.register_buffer("n_0", torch.tensor((self.kernel_size - 1) / 2.0))
+        n_0 = (self.kernel_size - 1) / 2.0
+        self.register_buffer("n_0", torch.tensor(n_0))
+        self.register_buffer("n", torch.arange(self.kernel_size) - n_0)
 
 
     def forward(self, x):
@@ -339,9 +349,9 @@ class SincConv1d(nn.Module):
         high = high / (self.sample_rate / 2)
 
         # 构造时间轴
-        n = (torch.arange(self.kernel_size, device=device) - self.n_0).view(1, -1)  # [1, kernel_size]
-        low = low.view(-1, 1)  # [out_channels, 1]
-        high = high.view(-1, 1)  # [out_channels, 1]
+        n = self.n.to(device).unsqueeze(0)  # [1, kernel_size]
+        low = low.unsqueeze(1)  # [out_channels, 1]
+        high = high.unsqueeze(1)  # [out_channels, 1]
 
         # sinc band-pass 滤波器（向量化）
         band_pass = (2 * high * self._sinc(2 * high * n) -
