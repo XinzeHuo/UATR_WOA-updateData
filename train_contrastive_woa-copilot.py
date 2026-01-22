@@ -35,8 +35,8 @@ class Config:
     TORCH_INTEROP_THREADS = 1
     DATA_LOADER_TIMEOUT = 120
     GPU_NUM_WORKERS = 0
-    N_EPOCHS = 100
-    LR = 1e-3
+    N_EPOCHS = 300
+    LR = 3e-4
     LR_MIN = 1e-5
     WEIGHT_DECAY = 1e-4
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -44,7 +44,8 @@ class Config:
     CKPT_PATH = "./encoder_contrastive_woa.pt"
 
     # 对比学习
-    CONTRASTIVE_TEMPERATURE = 0.1
+    CONTRASTIVE_TEMPERATURE = 0.07
+    DATASET_MULTIPLIER = 10
     USE_SUPERVISED_CONTRASTIVE = True  # 可切换以比较无监督与监督对比学习效果
     GRAD_CLIP_NORM = 1.0
 
@@ -110,6 +111,7 @@ class WOAContrastiveDataset(Dataset):
         min_samples_per_id: int = 2,
         sample_rate: int = 16000,
         max_duration_sec: float = 10.0,
+        multiplier: int = 1,
     ):
         super().__init__()
         self._warned_paths: set = set()
@@ -118,6 +120,7 @@ class WOAContrastiveDataset(Dataset):
             raise ValueError(f"sample_rate must be positive, got {sample_rate}")
         self.sample_rate = sample_rate
         self.max_len = int(max_duration_sec * sample_rate)
+        self.multiplier = multiplier
 
         csv_path = fix_path(csv_path)
         if not os.path.exists(csv_path):
@@ -204,7 +207,7 @@ class WOAContrastiveDataset(Dataset):
         return identity, class_label
 
     def __len__(self):
-        return len(self.identities)
+        return len(self.identities) * self.multiplier
 
     def _load_and_crop(self, wav_path: str) -> torch.Tensor:
         wav_path = fix_path(wav_path)
@@ -267,8 +270,9 @@ class WOAContrastiveDataset(Dataset):
         return cfg.MONO
 
     def __getitem__(self, index):
-        # index 是 identity 的索引
-        identity = self.identities[index]
+        # index 是 identity 的索引（经过 multiplier 扩展）
+        identity_index = index % len(self.identities)
+        identity = self.identities[identity_index]
         indices = self.id_to_indices[identity]
         cls = self.id_to_class[identity]
 
@@ -338,9 +342,13 @@ class SincConv1d(nn.Module):
         band = self.min_band_hz + torch.abs(self.band_hz)         # 保证 > min_band_hz
         high = low + band
 
-        # 归一化频率
-        low = low / (self.sample_rate / 2)
-        high = high / (self.sample_rate / 2)
+        # 归一化频率，并限制在有效范围内避免数值不稳定
+        nyquist = self.sample_rate / 2
+        low = torch.clamp(low / nyquist, 0.0, 0.95)
+        high = torch.clamp(high / nyquist, 0.05, 1.0)
+        
+        # 确保 high > low 以避免无效的频带
+        high = torch.max(high, low + 0.05)
 
         # 构造时间轴
         n = self.n.to(device).unsqueeze(0)  # [1, kernel_size]
@@ -351,6 +359,16 @@ class SincConv1d(nn.Module):
         band_pass = (2 * high * self._sinc(2 * high * n) -
                      2 * low * self._sinc(2 * low * n))
         band_pass = band_pass * self.window.to(device).unsqueeze(0)
+        
+        # 归一化滤波器以避免数值爆炸
+        max_vals = torch.abs(band_pass).max(dim=1, keepdim=True)[0]
+        # 使用更安全的 epsilon 值，并在滤波器接近零时跳过归一化
+        band_pass = torch.where(
+            max_vals > 1e-5,
+            band_pass / (max_vals + 1e-6),
+            band_pass
+        )
+        
         filters = band_pass.unsqueeze(1)  # [out_channels, 1, kernel_size]
 
         return F.conv1d(x, filters, stride=1, padding=self.kernel_size // 2)
@@ -466,13 +484,15 @@ class SqueezeExcite1d(nn.Module):
 class PhyLDCEncoder(nn.Module):
     """
     轻量级 1D CNN Encoder（对比学习用）：
+      - SincConv1d 前端 + MaxPool
       - 多层下采样卷积 + BN + ReLU
       - Global pooling 输出 embedding
     """
     def __init__(self,
                  dyn_hidden_channels: int = 128,
                  embed_dim: int = 128,
-                 dropout: float = 0.1):
+                 dropout: float = 0.1,
+                 sample_rate: int = 16000):
         super().__init__()
         if not 0 <= dropout <= 1:
             raise ValueError("dropout must be in [0, 1]")
@@ -485,9 +505,12 @@ class PhyLDCEncoder(nn.Module):
         mid_channels = max(cfg.CNN_MIN_MID_CHANNELS, dyn_hidden_channels // cfg.CNN_MID_DIVISOR)
 
         self.features = nn.Sequential(
-            nn.Conv1d(1, base_channels, kernel_size=7, stride=2, padding=3),
+            # SincConv1d: kernel_size=251 (~15.7ms at 16kHz) suitable for capturing phonetic/acoustic features
+            SincConv1d(base_channels, kernel_size=251, sample_rate=sample_rate),
             nn.BatchNorm1d(base_channels),
             nn.ReLU(),
+            # MaxPool1d matches the original stride=2 downsampling of the replaced Conv1d layer
+            nn.MaxPool1d(kernel_size=3, stride=2, padding=1),
             nn.Conv1d(base_channels, mid_channels, kernel_size=5, stride=2, padding=2),
             nn.BatchNorm1d(mid_channels),
             nn.ReLU(),
@@ -539,7 +562,8 @@ class ContrastiveModel(nn.Module):
         self.encoder = PhyLDCEncoder(
             dyn_hidden_channels=cfg.DYN_HIDDEN_CHANNELS,
             embed_dim=cfg.EMBED_DIM,
-            dropout=cfg.DROPOUT
+            dropout=cfg.DROPOUT,
+            sample_rate=cfg.SAMPLE_RATE
         )
         self.proj = ProjectionHead(cfg.EMBED_DIM, cfg.PROJ_DIM)
 
@@ -670,6 +694,7 @@ def train_contrastive(cfg: Config):
         min_samples_per_id=min_samples_per_id,
         sample_rate=cfg.SAMPLE_RATE,
         max_duration_sec=cfg.MAX_DURATION_SEC,
+        multiplier=cfg.DATASET_MULTIPLIER,
     )
     if len(dataset) == 0:
         raise ValueError(
@@ -693,7 +718,23 @@ def train_contrastive(cfg: Config):
     )
 
     model = ContrastiveModel(cfg).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.LR, weight_decay=cfg.WEIGHT_DECAY)
+    
+    # Use lower learning rate for SincConv parameters to prevent instability
+    sinc_params = []
+    other_params = []
+    for name, param in model.named_parameters():
+        # More robust check: identify SincConv by checking for its specific parameter names
+        if 'low_hz' in name or 'band_hz' in name:
+            sinc_params.append(param)
+        else:
+            other_params.append(param)
+    
+    param_groups = [
+        {'params': sinc_params, 'lr': cfg.LR * 0.1, 'name': 'sinc_conv'},  # 10x lower LR for SincConv
+        {'params': other_params, 'lr': cfg.LR, 'name': 'other'}
+    ]
+    
+    optimizer = torch.optim.AdamW(param_groups, weight_decay=cfg.WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.N_EPOCHS, eta_min=cfg.LR_MIN)
 
     for epoch in range(1, cfg.N_EPOCHS + 1):
@@ -711,7 +752,17 @@ def train_contrastive(cfg: Config):
             _, z2 = model(wav2)
 
             if torch.any(~torch.isfinite(z1)) or torch.any(~torch.isfinite(z2)):
-                print(f"[WARN] Non-finite embeddings at epoch {epoch}, step {step}, skip batch.")
+                if skipped_steps == 0:  # Only print detailed diagnostics for first failure
+                    print(f"\n[WARN] Non-finite embeddings detected at epoch {epoch}, step {step}")
+                    print(f"  Input wav1 - min: {wav1.min().item():.6f}, max: {wav1.max().item():.6f}, "
+                          f"has_nan: {torch.isnan(wav1).any().item()}, has_inf: {torch.isinf(wav1).any().item()}")
+                    print(f"  Input wav2 - min: {wav2.min().item():.6f}, max: {wav2.max().item():.6f}, "
+                          f"has_nan: {torch.isnan(wav2).any().item()}, has_inf: {torch.isinf(wav2).any().item()}")
+                    print(f"  Output z1 - has_nan: {torch.isnan(z1).any().item()}, has_inf: {torch.isinf(z1).any().item()}")
+                    print(f"  Output z2 - has_nan: {torch.isnan(z2).any().item()}, has_inf: {torch.isinf(z2).any().item()}")
+                    print(f"  Skipping batch and continuing training...")
+                else:
+                    print(f"[WARN] Non-finite embeddings at epoch {epoch}, step {step}, skip batch.")
                 skipped_steps += 1
                 continue
 
