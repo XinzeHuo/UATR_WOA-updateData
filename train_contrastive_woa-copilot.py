@@ -14,6 +14,7 @@ import torch.nn.functional as F
 import torchaudio
 from torch.utils.data import Dataset, DataLoader
 
+
 # ======================
 #  配置部分
 # ======================
@@ -25,11 +26,11 @@ class Config:
 
     # 采样率 & 时长
     SAMPLE_RATE = 16000
-    MAX_DURATION_SEC = 10.0   # 每个样本最多用 10s，可按需改长/改短
+    MAX_DURATION_SEC = 10.0  # 每个样本最多用 10s，可按需改长/改短
     MONO = True
 
     # 训练相关
-    BATCH_SIZE = 16           # 实际 batch size = 16 identity，每个 identity 有两个 view
+    BATCH_SIZE = 16  # 实际 batch size = 16 identity，每个 identity 有两个 view
     MAX_NUM_WORKERS = 4
     TORCH_NUM_THREADS = min(4, os.cpu_count() or 1)
     TORCH_INTEROP_THREADS = 1
@@ -69,9 +70,11 @@ class Config:
     MIN_SE_HIDDEN = 8
     WAVEFORM_MAX_ABS = 1.0
     MAX_NONFINITE_WARNINGS = 5
+    DEBUG_NAN_CHECKS = True  # 设为 False 可在生产环境中禁用 NaN 检查以提高性能
 
 
 cfg = Config()
+
 
 # ======================
 #  工具函数
@@ -81,11 +84,13 @@ def fix_path(path: str) -> str:
     """把 Windows 下的反斜杠路径安全地转成当前 OS 可读路径。"""
     return os.path.normpath(path)
 
+
 def set_seed(seed: int = 2026):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
 
 set_seed(2026)
 torch.set_num_threads(cfg.TORCH_NUM_THREADS)
@@ -104,14 +109,15 @@ class WOAContrastiveDataset(Dataset):
       - label: int (类别 label，用于 optional supervised contrastive)
     每个索引对应一个 identity（如 ClassA_dredger_id80），而非单条样本。
     """
+
     def __init__(
-        self,
-        csv_path: str,
-        split_prefix: str = "train",   # 根据 rel_path 是否以 'train' 开头筛选训练
-        min_samples_per_id: int = 2,
-        sample_rate: int = 16000,
-        max_duration_sec: float = 10.0,
-        multiplier: int = 1,
+            self,
+            csv_path: str,
+            split_prefix: str = "train",  # 根据 rel_path 是否以 'train' 开头筛选训练
+            min_samples_per_id: int = 2,
+            sample_rate: int = 16000,
+            max_duration_sec: float = 10.0,
+            multiplier: int = 1,
     ):
         super().__init__()
         self._warned_paths: set = set()
@@ -196,9 +202,9 @@ class WOAContrastiveDataset(Dataset):
             class_label = "Unknown"
             return identity, class_label
 
-        class_name = parts[1]          # ClassA
-        subtype = parts[2]             # dredger
-        id_part = parts[3]             # id80
+        class_name = parts[1]  # ClassA
+        subtype = parts[2]  # dredger
+        id_part = parts[3]  # id80
         # 作为 identity-key
         identity = f"{class_name}_{subtype}_{id_part}"
 
@@ -305,6 +311,7 @@ class SincConv1d(nn.Module):
     这里是一个常见实现的简化版：学习每个 band-pass 的低/高截止频率，
     在时间域构造 sinc 滤波器再做 conv1d。
     """
+
     def __init__(self, out_channels, kernel_size, sample_rate,
                  min_low_hz=50, min_band_hz=50):
         super().__init__()
@@ -331,22 +338,21 @@ class SincConv1d(nn.Module):
         self.register_buffer("n_0", torch.tensor(n_0))
         self.register_buffer("n", torch.arange(self.kernel_size) - n_0)
 
-
     def forward(self, x):
         """
         x: [B, 1, T]
         输出: [B, out_channels, T_conv]
         """
         device = x.device
-        low = self.min_low_hz + torch.abs(self.low_hz)            # 保证 > min_low_hz
-        band = self.min_band_hz + torch.abs(self.band_hz)         # 保证 > min_band_hz
+        low = self.min_low_hz + torch.abs(self.low_hz)  # 保证 > min_low_hz
+        band = self.min_band_hz + torch.abs(self.band_hz)  # 保证 > min_band_hz
         high = low + band
 
         # 归一化频率，并限制在有效范围内避免数值不稳定
         nyquist = self.sample_rate / 2
         low = torch.clamp(low / nyquist, 0.0, 0.95)
         high = torch.clamp(high / nyquist, 0.05, 1.0)
-        
+
         # 确保 high > low 以避免无效的频带
         high = torch.max(high, low + 0.05)
 
@@ -356,22 +362,27 @@ class SincConv1d(nn.Module):
         high = high.unsqueeze(1)  # [out_channels, 1]
 
         # sinc band-pass 滤波器（向量化）
+        # 使用标准 SincNet 公式
         band_pass = (2 * high * self._sinc(2 * high * n) -
                      2 * low * self._sinc(2 * low * n))
         band_pass = band_pass * self.window.to(device).unsqueeze(0)
-        
-        # 归一化滤波器以避免数值爆炸
-        max_vals = torch.abs(band_pass).max(dim=1, keepdim=True)[0]
-        # 使用更安全的 epsilon 值，并在滤波器接近零时跳过归一化
-        band_pass = torch.where(
-            max_vals > 1e-5,
-            band_pass / (max_vals + 1e-6),
-            band_pass
-        )
-        
+
+        # 检查并处理 NaN/Inf 值（可通过 cfg.DEBUG_NAN_CHECKS 禁用）
+        if cfg.DEBUG_NAN_CHECKS and not torch.isfinite(band_pass).all():
+            band_pass = torch.nan_to_num(band_pass, nan=0.0, posinf=1.0, neginf=-1.0)
+
         filters = band_pass.unsqueeze(1)  # [out_channels, 1, kernel_size]
 
-        return F.conv1d(x, filters, stride=1, padding=self.kernel_size // 2)
+        # 应用卷积并缩放输出以匹配标准 Conv1d 的输出范围
+        output = F.conv1d(x, filters, stride=1, padding=self.kernel_size // 2)
+        # 使用可学习的缩放因子或固定缩放，这里使用简单的除以 sqrt(kernel_size)
+        output = output / math.sqrt(self.kernel_size)
+
+        # 最终安全检查
+        if cfg.DEBUG_NAN_CHECKS and not torch.isfinite(output).all():
+            output = torch.nan_to_num(output, nan=0.0, posinf=1.0, neginf=-1.0)
+
+        return output
 
     @staticmethod
     def _sinc(x):
@@ -391,6 +402,7 @@ class DynamicConv1d(nn.Module):
       - 根据输入的全局统计（avg-pool）生成 K 个 mixing 权重
       - 输出为 K 个 conv 结果按权重线性组合
     """
+
     def __init__(self, in_channels, out_channels, kernel_size, num_kernels=4, stride=1, padding=None):
         super().__init__()
         self.in_channels = in_channels
@@ -488,6 +500,7 @@ class PhyLDCEncoder(nn.Module):
       - 多层下采样卷积 + BN + ReLU
       - Global pooling 输出 embedding
     """
+
     def __init__(self,
                  dyn_hidden_channels: int = 128,
                  embed_dim: int = 128,
@@ -507,15 +520,15 @@ class PhyLDCEncoder(nn.Module):
         self.features = nn.Sequential(
             # SincConv1d: kernel_size=251 (~15.7ms at 16kHz) suitable for capturing phonetic/acoustic features
             SincConv1d(base_channels, kernel_size=251, sample_rate=sample_rate),
-            nn.BatchNorm1d(base_channels),
+            nn.BatchNorm1d(base_channels, eps=1e-4, momentum=0.1),
             nn.ReLU(),
             # MaxPool1d matches the original stride=2 downsampling of the replaced Conv1d layer
             nn.MaxPool1d(kernel_size=3, stride=2, padding=1),
             nn.Conv1d(base_channels, mid_channels, kernel_size=5, stride=2, padding=2),
-            nn.BatchNorm1d(mid_channels),
+            nn.BatchNorm1d(mid_channels, eps=1e-4, momentum=0.1),
             nn.ReLU(),
             nn.Conv1d(mid_channels, dyn_hidden_channels, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm1d(dyn_hidden_channels),
+            nn.BatchNorm1d(dyn_hidden_channels, eps=1e-4, momentum=0.1),
             nn.ReLU(),
         )
         self.pool = nn.AdaptiveAvgPool1d(1)
@@ -528,6 +541,10 @@ class PhyLDCEncoder(nn.Module):
         输出: [B, embed_dim]
         """
         x = self.features(x)
+        # 检测并处理 NaN 值（可通过 cfg.DEBUG_NAN_CHECKS 禁用）
+        if cfg.DEBUG_NAN_CHECKS and not torch.isfinite(x).all():
+            # 如果特征提取后出现 NaN，用零替换
+            x = torch.nan_to_num(x, nan=0.0)
         x = self.pool(x).squeeze(-1)
         x = self.dropout(x)
         return self.fc(x)
@@ -557,6 +574,7 @@ class ContrastiveModel(nn.Module):
       - proj_head: ProjectionHead
     Stage 3 的时候，只需要加载 encoder 部分即可。
     """
+
     def __init__(self, cfg: Config):
         super().__init__()
         self.encoder = PhyLDCEncoder(
@@ -616,7 +634,7 @@ def contrastive_loss_nt_xent(z1, z2, temperature: float = 0.1):
 
     # 构造正样本 mask
     labels = torch.arange(batch_size, device=z1.device)
-    labels = torch.cat([labels, labels], dim=0)   # [2B]
+    labels = torch.cat([labels, labels], dim=0)  # [2B]
 
     # mask：对角线不算，且只把 (i, i+B) / (i+B, i) 当成正
     mask = torch.eye(2 * batch_size, dtype=torch.bool, device=z1.device)
@@ -718,7 +736,7 @@ def train_contrastive(cfg: Config):
     )
 
     model = ContrastiveModel(cfg).to(device)
-    
+
     # Use lower learning rate for SincConv parameters to prevent instability
     sinc_params = []
     other_params = []
@@ -728,12 +746,12 @@ def train_contrastive(cfg: Config):
             sinc_params.append(param)
         else:
             other_params.append(param)
-    
+
     param_groups = [
         {'params': sinc_params, 'lr': cfg.LR * 0.1, 'name': 'sinc_conv'},  # 10x lower LR for SincConv
         {'params': other_params, 'lr': cfg.LR, 'name': 'other'}
     ]
-    
+
     optimizer = torch.optim.AdamW(param_groups, weight_decay=cfg.WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cfg.N_EPOCHS, eta_min=cfg.LR_MIN)
 
@@ -748,7 +766,7 @@ def train_contrastive(cfg: Config):
             wav2 = wav2.to(device)
             cls = cls.to(device)
 
-            _, z1 = model(wav1)   # (encoder_z1, proj_z1)，这里我们只要 proj 输出参与 loss
+            _, z1 = model(wav1)  # (encoder_z1, proj_z1)，这里我们只要 proj 输出参与 loss
             _, z2 = model(wav2)
 
             if torch.any(~torch.isfinite(z1)) or torch.any(~torch.isfinite(z2)):
@@ -758,8 +776,10 @@ def train_contrastive(cfg: Config):
                           f"has_nan: {torch.isnan(wav1).any().item()}, has_inf: {torch.isinf(wav1).any().item()}")
                     print(f"  Input wav2 - min: {wav2.min().item():.6f}, max: {wav2.max().item():.6f}, "
                           f"has_nan: {torch.isnan(wav2).any().item()}, has_inf: {torch.isinf(wav2).any().item()}")
-                    print(f"  Output z1 - has_nan: {torch.isnan(z1).any().item()}, has_inf: {torch.isinf(z1).any().item()}")
-                    print(f"  Output z2 - has_nan: {torch.isnan(z2).any().item()}, has_inf: {torch.isinf(z2).any().item()}")
+                    print(
+                        f"  Output z1 - has_nan: {torch.isnan(z1).any().item()}, has_inf: {torch.isinf(z1).any().item()}")
+                    print(
+                        f"  Output z2 - has_nan: {torch.isnan(z2).any().item()}, has_inf: {torch.isinf(z2).any().item()}")
                     print(f"  Skipping batch and continuing training...")
                 else:
                     print(f"[WARN] Non-finite embeddings at epoch {epoch}, step {step}, skip batch.")
